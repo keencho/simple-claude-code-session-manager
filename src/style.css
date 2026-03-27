@@ -157,6 +157,99 @@ header {
   padding-left: 2px;
 }
 
+/* === Open Here Bar === */
+.open-here-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  margin-bottom: 10px;
+  border-radius: var(--radius-sm);
+  border: 1px dashed rgba(61, 220, 132, 0.2);
+  background: rgba(61, 220, 132, 0.03);
+}
+
+.btn-open-here {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 18px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(61, 220, 132, 0.25);
+  background: rgba(61, 220, 132, 0.1);
+  color: var(--green);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.btn-open-here:hover {
+  background: rgba(61, 220, 132, 0.18);
+  border-color: rgba(61, 220, 132, 0.4);
+}
+
+.btn-open-here:active {
+  opacity: 0.85;
+}
+
+/* === Toss-style Toggle Switch === */
+.toggle-skip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.toggle-skip input[type="checkbox"] {
+  display: none;
+}
+
+.toggle-track {
+  position: relative;
+  width: 36px;
+  height: 20px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.1);
+  transition: background 0.25s;
+  flex-shrink: 0;
+}
+
+.toggle-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+  transition: all 0.25s;
+}
+
+.toggle-skip input:checked + .toggle-track {
+  background: rgba(240, 154, 50, 0.25);
+}
+
+.toggle-skip input:checked + .toggle-track .toggle-thumb {
+  left: 18px;
+  background: var(--orange);
+}
+
+.toggle-text {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  transition: color 0.2s;
+  white-space: nowrap;
+}
+
+.toggle-skip input:checked ~ .toggle-text {
+  color: var(--orange);
+}
+
 /* === Chips === */
 .chip-row {
   display: flex;
@@ -352,9 +445,19 @@ header {
   color: var(--green);
 }
 
+/* Card actions row */
+.card-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.card-actions .btn-resume {
+  flex: 1;
+}
+
 /* Resume button */
 .btn-resume {
-  width: 100%;
   padding: 12px 0;
   border-radius: var(--radius-sm);
   border: none;

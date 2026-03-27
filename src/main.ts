@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 
 interface SessionInfo {
   session_id: string;
@@ -134,7 +135,7 @@ function getProjectLabelGroups(): { label: string; projectCount: number; session
       projectCount: data.folders.size,
       sessionCount: data.sessionCount,
     }))
-    .sort((a, b) => b.sessionCount - a.sessionCount);
+    .sort((a, b) => a.label.localeCompare(b.label, "ko"));
 }
 
 /** Get session labels for currently active filter */
@@ -160,7 +161,7 @@ function getSessionLabelsForChips(): { name: string; count: number }[] {
   }
   const labels = Array.from(map.entries())
     .map(([name, count]) => ({ name, count }))
-    .sort((a, b) => b.count - a.count);
+    .sort((a, b) => a.name.localeCompare(b.name, "ko"));
   if (unlabeled > 0) {
     labels.push({ name: "", count: unlabeled });
   }
@@ -169,9 +170,24 @@ function getSessionLabelsForChips(): { name: string; count: number }[] {
 
 // --- Actions ---
 
-async function resumeSession(sessionId: string, projectPath: string) {
+async function resumeSession(sessionId: string, projectPath: string, skipPermissions: boolean) {
   try {
-    await invoke("resume_session", { sessionId, projectPath });
+    await invoke("resume_session", { sessionId, projectPath, skipPermissions });
+  } catch (e) {
+    alert("실행 실패: " + e);
+  }
+}
+
+async function openClaudeHere() {
+  const selected = await open({ directory: true, multiple: false, title: "Claude를 열 폴더 선택" });
+  if (!selected) return;
+
+  const path = typeof selected === "string" ? selected : selected;
+  const skipEl = document.getElementById("open-here-skip") as HTMLInputElement | null;
+  const skip = skipEl?.checked ?? false;
+
+  try {
+    await invoke("open_claude", { projectPath: path, skipPermissions: skip });
   } catch (e) {
     alert("실행 실패: " + e);
   }
@@ -372,9 +388,16 @@ function renderList() {
         ${s.git_branch ? `<span class="tag tag-branch">${escapeHtml(s.git_branch)}</span>` : ""}
         <span class="tag">${s.message_count}개 메시지</span>
       </div>
-      <button class="btn-resume" data-action="resume" data-id="${s.session_id}" data-project="${escapeHtml(s.project_path)}">
-        Resume
-      </button>
+      <div class="card-actions">
+        <label class="toggle-skip" title="--dangerously-skip-permissions">
+          <input type="checkbox" data-skip-for="${s.session_id}" />
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="toggle-text">퍼미션 스킵</span>
+        </label>
+        <button class="btn-resume" data-action="resume" data-id="${s.session_id}" data-project="${escapeHtml(s.project_path)}">
+          Resume
+        </button>
+      </div>
     </div>
   `
     )
@@ -396,6 +419,17 @@ function renderShell() {
           <button id="refresh-btn" class="btn-ghost" title="새로고침">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 4v6h6"/><path d="M23 20v-6h-6"/><path d="M20.49 9A9 9 0 005.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 013.51 15"/></svg>
           </button>
+        </div>
+        <div class="open-here-bar">
+          <button id="open-here-btn" class="btn-open-here">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+            폴더에서 Claude 열기
+          </button>
+          <label class="toggle-skip" title="--dangerously-skip-permissions">
+            <input type="checkbox" id="open-here-skip" />
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            <span class="toggle-text">퍼미션 스킵</span>
+          </label>
         </div>
         <div class="toolbar-row2">
           <select id="project-filter"></select>
@@ -419,6 +453,9 @@ function renderShell() {
     searchQuery = searchInput.value;
     renderList();
   });
+
+  // Open Claude here — folder picker
+  document.getElementById("open-here-btn")!.addEventListener("click", openClaudeHere);
 
   // Project filter select — specific project
   const projectFilter = document.getElementById("project-filter") as HTMLSelectElement;
@@ -487,7 +524,11 @@ function renderShell() {
 
     const action = target.dataset.action;
     if (action === "resume") {
-      resumeSession(target.dataset.id!, target.dataset.project!);
+      const sessionId = target.dataset.id!;
+      const projectPath = target.dataset.project!;
+      const skipCb = document.querySelector(`input[data-skip-for="${sessionId}"]`) as HTMLInputElement | null;
+      const skip = skipCb?.checked ?? false;
+      resumeSession(sessionId, projectPath, skip);
     } else if (action === "label") {
       setSessionLabel(target.dataset.id!);
     } else if (action === "delete") {

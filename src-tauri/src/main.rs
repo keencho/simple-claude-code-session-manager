@@ -517,14 +517,36 @@ fn cleanup_empty_project(project_dir: &Path) {
 }
 
 #[tauri::command]
-fn resume_session(session_id: String, project_path: String) -> Result<(), String> {
+fn resume_session(session_id: String, project_path: String, skip_permissions: bool) -> Result<(), String> {
     use std::process::Command;
 
+    let skip_flag = if skip_permissions { " --dangerously-skip-permissions" } else { "" };
     let temp_dir = std::env::temp_dir();
     let bat_path = temp_dir.join("kcsm_resume.bat");
     let bat_content = format!(
-        "@echo off\r\ncd /d \"{}\"\r\nclaude --resume {}\r\n",
-        project_path, session_id
+        "@echo off\r\ncd /d \"{}\"\r\nclaude --resume {}{}\r\n",
+        project_path, session_id, skip_flag
+    );
+    fs::write(&bat_path, &bat_content).map_err(|e| e.to_string())?;
+
+    Command::new("cmd")
+        .args(["/c", "start", "cmd", "/k", bat_path.to_str().unwrap_or("")])
+        .spawn()
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn open_claude(project_path: String, skip_permissions: bool) -> Result<(), String> {
+    use std::process::Command;
+
+    let skip_flag = if skip_permissions { " --dangerously-skip-permissions" } else { "" };
+    let temp_dir = std::env::temp_dir();
+    let bat_path = temp_dir.join("kcsm_open.bat");
+    let bat_content = format!(
+        "@echo off\r\ncd /d \"{}\"\r\nclaude{}\r\n",
+        project_path, skip_flag
     );
     fs::write(&bat_path, &bat_content).map_err(|e| e.to_string())?;
 
@@ -539,6 +561,7 @@ fn resume_session(session_id: String, project_path: String) -> Result<(), String
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(AppCache::default()))
         .invoke_handler(tauri::generate_handler![
             get_sessions,
@@ -548,7 +571,8 @@ fn main() {
             set_label,
             delete_session,
             delete_project_sessions,
-            resume_session
+            resume_session,
+            open_claude
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
