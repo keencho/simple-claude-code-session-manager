@@ -109,7 +109,8 @@ function getProjects(): { folder: string; path: string }[] {
       const lb = getProjectLabel(b.folder);
       if (la && !lb) return -1;
       if (!la && lb) return 1;
-      return a.path.localeCompare(b.path);
+      if (la && lb) return la.localeCompare(lb, "ko");
+      return a.path.localeCompare(b.path, "ko");
     });
 }
 
