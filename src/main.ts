@@ -173,8 +173,9 @@ function getSessionLabelsForChips(): { name: string; count: number }[] {
 // --- Actions ---
 
 async function resumeSession(sessionId: string, projectPath: string, skipPermissions: boolean) {
-  const newWindowEl = document.getElementById("global-new-window") as HTMLInputElement | null;
-  const newWindow = newWindowEl?.checked ?? false;
+  const perSession = document.querySelector(`input[data-newwin-for="${sessionId}"]`) as HTMLInputElement | null;
+  const globalEl = document.getElementById("global-new-window") as HTMLInputElement | null;
+  const newWindow = perSession?.checked ?? globalEl?.checked ?? false;
   try {
     await invoke("resume_session", { sessionId, projectPath, skipPermissions, newWindow });
   } catch (e) {
@@ -421,9 +422,14 @@ function renderList() {
       </div>
       <div class="card-actions">
         <label class="toggle-skip" title="--dangerously-skip-permissions">
-          <input type="checkbox" data-skip-for="${s.session_id}" />
+          <input type="checkbox" data-skip-for="${s.session_id}" checked />
           <span class="toggle-track"><span class="toggle-thumb"></span></span>
           <span class="toggle-text">퍼미션 스킵</span>
+        </label>
+        <label class="toggle-skip" title="New Window (OFF = attach as tab)">
+          <input type="checkbox" data-newwin-for="${s.session_id}" />
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="toggle-text">New Window</span>
         </label>
         <button class="btn-resume" data-action="resume" data-id="${s.session_id}" data-project="${escapeHtml(s.project_path)}">
           Resume
@@ -457,7 +463,7 @@ function renderShell() {
             폴더에서 Claude 열기
           </button>
           <label class="toggle-skip" title="--dangerously-skip-permissions">
-            <input type="checkbox" id="open-here-skip" />
+            <input type="checkbox" id="open-here-skip" checked />
             <span class="toggle-track"><span class="toggle-thumb"></span></span>
             <span class="toggle-text">퍼미션 스킵</span>
           </label>
