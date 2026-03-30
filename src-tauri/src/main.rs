@@ -607,7 +607,7 @@ fn cleanup_empty_project(project_dir: &Path) {
 }
 
 #[tauri::command]
-fn resume_session(session_id: String, project_path: String, skip_permissions: bool) -> Result<(), String> {
+fn resume_session(session_id: String, project_path: String, skip_permissions: bool, new_window: bool) -> Result<(), String> {
     use std::process::Command;
 
     let skip_flag = if skip_permissions { " --dangerously-skip-permissions" } else { "" };
@@ -619,10 +619,17 @@ fn resume_session(session_id: String, project_path: String, skip_permissions: bo
     );
     fs::write(&bat_path, &bat_content).map_err(|e| e.to_string())?;
 
-    Command::new("cmd")
-        .args(["/c", "start", "cmd", "/k", bat_path.to_str().unwrap_or("")])
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    if new_window {
+        Command::new("cmd")
+            .args(["/c", "start", "cmd", "/k", bat_path.to_str().unwrap_or("")])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    } else {
+        Command::new("wt.exe")
+            .args(["-w", "0", "new-tab", "cmd", "/k", bat_path.to_str().unwrap_or("")])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
 
     Ok(())
 }

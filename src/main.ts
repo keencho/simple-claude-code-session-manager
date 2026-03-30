@@ -173,8 +173,10 @@ function getSessionLabelsForChips(): { name: string; count: number }[] {
 // --- Actions ---
 
 async function resumeSession(sessionId: string, projectPath: string, skipPermissions: boolean) {
+  const newWindowEl = document.getElementById("global-new-window") as HTMLInputElement | null;
+  const newWindow = newWindowEl?.checked ?? false;
   try {
-    await invoke("resume_session", { sessionId, projectPath, skipPermissions });
+    await invoke("resume_session", { sessionId, projectPath, skipPermissions, newWindow });
   } catch (e) {
     alert("실행 실패: " + e);
   }
@@ -458,6 +460,11 @@ function renderShell() {
             <input type="checkbox" id="open-here-skip" />
             <span class="toggle-track"><span class="toggle-thumb"></span></span>
             <span class="toggle-text">퍼미션 스킵</span>
+          </label>
+          <label class="toggle-skip" title="New Window (OFF = attach as tab in existing terminal)">
+            <input type="checkbox" id="global-new-window" />
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            <span class="toggle-text">New Window</span>
           </label>
         </div>
         <div class="toolbar-row2">
