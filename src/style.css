@@ -402,11 +402,38 @@ header {
   font-weight: 600;
   line-height: 1.5;
   margin-bottom: 6px;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  word-break: break-all;
+}
+
+.card-prompt > span,
+.card-prompt > .custom-title {
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
-  word-break: break-all;
+  flex: 1;
+}
+
+.custom-title {
+  color: var(--accent);
+}
+
+.btn-title {
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.15s;
+  margin-top: 2px;
+}
+
+.card:hover .btn-title {
+  opacity: 0.5;
+}
+
+.card .btn-title:hover {
+  opacity: 1;
 }
 
 .card-summary {

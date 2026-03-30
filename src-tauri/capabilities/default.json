@@ -8,6 +8,8 @@
     "shell:allow-execute",
     "shell:default",
     "dialog:default",
-    "dialog:allow-open"
+    "dialog:allow-open",
+    "dialog:allow-ask",
+    "dialog:allow-confirm"
   ]
 }

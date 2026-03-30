@@ -49,6 +49,7 @@ struct SessionInfo {
     project_path: String,
     project_folder: String,
     label: String,
+    custom_title: String,
 }
 
 // Send + Sync for rayon
@@ -87,6 +88,23 @@ fn get_labels_path() -> Option<PathBuf> {
 
 fn get_project_labels_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("project-labels.json"))
+}
+
+fn get_session_titles_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude").join("session-titles.json"))
+}
+
+fn load_session_titles() -> HashMap<String, String> {
+    get_session_titles_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_session_titles(titles: &HashMap<String, String>) -> Result<(), String> {
+    let path = get_session_titles_path().ok_or("Cannot find home directory")?;
+    let json = serde_json::to_string_pretty(titles).map_err(|e| e.to_string())?;
+    fs::write(path, json).map_err(|e| e.to_string())
 }
 
 fn load_labels() -> Labels {
@@ -182,6 +200,8 @@ fn file_time_to_rfc3339(path: &Path, use_modified: bool) -> String {
 }
 
 fn decode_folder_to_path(folder: &str) -> String {
+    // Encoding: `--` = `:\`, single `-` = either `\` or literal `-`
+    // Strategy: decode `--` first, then resolve ambiguous `-` by checking filesystem
     let mut result = String::new();
     let mut chars = folder.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -191,13 +211,60 @@ fn decode_folder_to_path(folder: &str) -> String {
                 result.push(':');
                 result.push('\\');
             } else {
-                result.push('\\');
+                // Placeholder for ambiguous `-`
+                result.push('\x00');
             }
         } else {
             result.push(ch);
         }
     }
-    result
+
+    // Resolve ambiguous `-` (could be `\` or literal `-`)
+    // Try filesystem: greedily match longest existing path segments
+    resolve_ambiguous_path(&result)
+}
+
+fn resolve_ambiguous_path(template: &str) -> String {
+    let parts: Vec<&str> = template.split('\x00').collect();
+    if parts.len() <= 1 {
+        return template.replace('\x00', "-");
+    }
+
+    fn find_best(parts: &[&str], idx: usize, current: String) -> Option<String> {
+        if idx >= parts.len() {
+            // Final path — check if it exists
+            if Path::new(&current).exists() {
+                return Some(current);
+            }
+            return None;
+        }
+
+        if idx == 0 {
+            return find_best(parts, 1, parts[0].to_string());
+        }
+
+        // Try `\` (path separator) first — more common
+        let with_sep = format!("{}\\{}", current, parts[idx]);
+        if let Some(result) = find_best(parts, idx + 1, with_sep) {
+            return Some(result);
+        }
+
+        // Try `-` (literal hyphen)
+        let with_hyphen = format!("{}-{}", current, parts[idx]);
+        if let Some(result) = find_best(parts, idx + 1, with_hyphen) {
+            return Some(result);
+        }
+
+        None
+    }
+
+    // Try to find existing path via backtracking
+    if let Some(resolved) = find_best(&parts, 0, String::new()) {
+        return resolved;
+    }
+
+    // Fallback: treat all as `\`
+    parts.join("\\")
 }
 
 /// Scan a single project directory — designed to run in parallel
@@ -205,6 +272,7 @@ fn scan_project(
     project_dir: &Path,
     folder_name: &str,
     labels: &Labels,
+    titles: &HashMap<String, String>,
 ) -> Vec<SessionInfo> {
     let mut sessions = Vec::new();
 
@@ -255,6 +323,7 @@ fn scan_project(
             .to_string();
 
         let label = labels.labels.get(&session_id).cloned().unwrap_or_default();
+        let custom_title = titles.get(&session_id).cloned().unwrap_or_default();
 
         if let Some(idx) = indexed.get(&session_id) {
             sessions.push(SessionInfo {
@@ -268,6 +337,7 @@ fn scan_project(
                 project_path: project_path.clone(),
                 project_folder: folder_name.to_string(),
                 label,
+                custom_title,
             });
         } else {
             // Fallback: minimal JSONL read
@@ -288,6 +358,7 @@ fn scan_project(
                 project_path: project_path.clone(),
                 project_folder: folder_name.to_string(),
                 label,
+                custom_title,
             });
         }
     }
@@ -302,6 +373,7 @@ fn scan_all_sessions() -> Result<Vec<SessionInfo>, String> {
     }
 
     let labels = load_labels();
+    let titles = load_session_titles();
 
     // Collect project directories
     let project_dirs: Vec<_> = fs::read_dir(&projects_dir)
@@ -320,7 +392,7 @@ fn scan_all_sessions() -> Result<Vec<SessionInfo>, String> {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            scan_project(dir, &folder, &labels)
+            scan_project(dir, &folder, &labels, &titles)
         })
         .collect();
 
@@ -412,6 +484,17 @@ fn set_project_label(project_folder: String, label: String) -> Result<(), String
 }
 
 #[tauri::command]
+fn set_session_title(session_id: String, title: String) -> Result<(), String> {
+    let mut titles = load_session_titles();
+    if title.is_empty() {
+        titles.remove(&session_id);
+    } else {
+        titles.insert(session_id, title);
+    }
+    save_session_titles(&titles)
+}
+
+#[tauri::command]
 fn set_label(session_id: String, label: String) -> Result<(), String> {
     let mut labels = load_labels();
     if label.is_empty() {
@@ -454,10 +537,14 @@ fn delete_session(session_id: String, project_folder: String) -> Result<(), Stri
         }
     }
 
-    // Remove label
+    // Remove label & title
     let mut labels = load_labels();
     labels.labels.remove(&session_id);
     let _ = save_labels(&labels);
+
+    let mut titles = load_session_titles();
+    titles.remove(&session_id);
+    let _ = save_session_titles(&titles);
 
     cleanup_empty_project(&project_dir);
     Ok(())
@@ -473,6 +560,7 @@ fn delete_project_sessions(project_folder: String) -> Result<u32, String> {
 
     let mut deleted = 0u32;
     let mut labels = load_labels();
+    let mut titles = load_session_titles();
 
     let entries: Vec<_> = fs::read_dir(&project_dir)
         .map_err(|e| e.to_string())?
@@ -486,6 +574,7 @@ fn delete_project_sessions(project_folder: String) -> Result<u32, String> {
         if name.ends_with(".jsonl") {
             let sid = name.trim_end_matches(".jsonl");
             labels.labels.remove(sid);
+            titles.remove(sid);
             let data_dir = project_dir.join(sid);
             if data_dir.is_dir() {
                 let _ = fs::remove_dir_all(&data_dir);
@@ -496,6 +585,7 @@ fn delete_project_sessions(project_folder: String) -> Result<u32, String> {
     }
 
     let _ = save_labels(&labels);
+    let _ = save_session_titles(&titles);
     let _ = fs::remove_file(project_dir.join("sessions-index.json"));
     cleanup_empty_project(&project_dir);
     Ok(deleted)
@@ -569,6 +659,7 @@ fn main() {
             get_project_labels,
             set_project_label,
             set_label,
+            set_session_title,
             delete_session,
             delete_project_sessions,
             resume_session,

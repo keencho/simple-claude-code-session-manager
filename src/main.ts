@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, confirm as tauriConfirm } from "@tauri-apps/plugin-dialog";
 
 interface SessionInfo {
   session_id: string;
@@ -12,6 +12,7 @@ interface SessionInfo {
   project_path: string;
   project_folder: string;
   label: string;
+  custom_title: string;
 }
 
 // --- State ---
@@ -75,6 +76,7 @@ function getFilteredSessions(): SessionInfo[] {
       s.first_prompt.toLowerCase().includes(q) ||
       s.summary.toLowerCase().includes(q) ||
       s.label.toLowerCase().includes(q) ||
+      s.custom_title.toLowerCase().includes(q) ||
       s.project_path.toLowerCase().includes(q) ||
       s.git_branch.toLowerCase().includes(q) ||
       projLabel.includes(q);
@@ -193,6 +195,21 @@ async function openClaudeHere() {
   }
 }
 
+async function setSessionTitle(sessionId: string) {
+  const session = allSessions.find((s) => s.session_id === sessionId);
+  const current = session?.custom_title || "";
+  const title = prompt("커스텀 제목 입력 (비우면 삭제):", current);
+  if (title === null) return;
+
+  try {
+    await invoke("set_session_title", { sessionId, title });
+    if (session) session.custom_title = title;
+    renderList();
+  } catch (e) {
+    alert("제목 저장 실패: " + e);
+  }
+}
+
 async function setSessionLabel(sessionId: string) {
   const session = allSessions.find((s) => s.session_id === sessionId);
   const current = session?.label || "";
@@ -232,12 +249,16 @@ async function setProjectLabel(folder: string, currentPath: string) {
   }
 }
 
+let deleteInProgress = false;
 async function deleteSession(sessionId: string, projectFolder: string) {
-  const session = allSessions.find((s) => s.session_id === sessionId);
-  const desc = session?.label || session?.first_prompt?.slice(0, 40) || sessionId;
-  if (!confirm(`"${desc}" 세션을 삭제할까요?`)) return;
-
+  if (deleteInProgress) return;
+  deleteInProgress = true;
   try {
+    const session = allSessions.find((s) => s.session_id === sessionId);
+    const desc = session?.custom_title || session?.label || session?.first_prompt?.slice(0, 40) || sessionId;
+    const ok = await tauriConfirm(`"${desc}" 세션을 삭제할까요?`, { title: "세션 삭제", kind: "warning" });
+    if (!ok) return;
+
     await invoke("delete_session", { sessionId, projectFolder });
     allSessions = allSessions.filter((s) => s.session_id !== sessionId);
     renderChips();
@@ -245,6 +266,8 @@ async function deleteSession(sessionId: string, projectFolder: string) {
     renderProjectFilter();
   } catch (e) {
     alert("삭제 실패: " + e);
+  } finally {
+    deleteInProgress = false;
   }
 }
 
@@ -254,12 +277,11 @@ async function deleteCurrentProject() {
   const folder = sessions[0]?.project_folder;
   if (!folder) return;
 
-  if (
-    !confirm(
-      `"${getProjectDisplayName(folder, filterProject)}" 프로젝트의 세션 ${sessions.length}개를 모두 삭제할까요?\n\n(되돌릴 수 없습니다)`
-    )
-  )
-    return;
+  const ok = await tauriConfirm(
+    `"${getProjectDisplayName(folder, filterProject)}" 프로젝트의 세션 ${sessions.length}개를 모두 삭제할까요?\n\n(되돌릴 수 없습니다)`,
+    { title: "프로젝트 세션 전체 삭제", kind: "warning" }
+  );
+  if (!ok) return;
 
   try {
     await invoke("delete_project_sessions", { projectFolder: folder });
@@ -381,7 +403,14 @@ function renderList() {
           </button>
         </div>
       </div>
-      <div class="card-prompt">${escapeHtml(s.first_prompt || "(내용 없음)")}</div>
+      <div class="card-prompt">
+        ${s.custom_title
+          ? `<span class="custom-title">${escapeHtml(s.custom_title)}</span>`
+          : `<span>${escapeHtml(s.first_prompt || "(내용 없음)")}</span>`}
+        <button class="btn-icon btn-title" data-action="title" data-id="${s.session_id}" title="커스텀 제목 편집">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+        </button>
+      </div>
       ${s.summary ? `<div class="card-summary">${escapeHtml(s.summary)}</div>` : ""}
       <div class="card-tags">
         <span class="tag tag-project">${escapeHtml(getProjectLabel(s.project_folder) || s.project_path)}</span>
@@ -521,6 +550,7 @@ function renderShell() {
   document.getElementById("content-area")!.addEventListener("click", (e) => {
     const target = (e.target as HTMLElement).closest("[data-action]") as HTMLElement | null;
     if (!target) return;
+    e.stopPropagation();
 
     const action = target.dataset.action;
     if (action === "resume") {
@@ -529,6 +559,8 @@ function renderShell() {
       const skipCb = document.querySelector(`input[data-skip-for="${sessionId}"]`) as HTMLInputElement | null;
       const skip = skipCb?.checked ?? false;
       resumeSession(sessionId, projectPath, skip);
+    } else if (action === "title") {
+      setSessionTitle(target.dataset.id!);
     } else if (action === "label") {
       setSessionLabel(target.dataset.id!);
     } else if (action === "delete") {
