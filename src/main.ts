@@ -172,12 +172,33 @@ function getSessionLabelsForChips(): { name: string; count: number }[] {
 
 // --- Actions ---
 
+function buildTabTitle(sessionId: string): string {
+  const session = allSessions.find(s => s.session_id === sessionId);
+  if (!session) return "Claude Session";
+  // project name: use label > last segment of project_path
+  const pp = session.project_path.replace(/\\/g, "/");
+  const lastSegment = pp.split("/").filter(Boolean).pop() || "";
+  const projectName = getProjectLabel(session.project_folder) || lastSegment;
+  const title = session.custom_title || session.label || session.first_prompt?.slice(0, 50) || "";
+  if (projectName && title) return `${projectName}:${title}`;
+  if (projectName) return projectName;
+  if (title) return title;
+  // fallback: drive:/last2
+  const parts = pp.split("/").filter(Boolean);
+  if (parts.length >= 2) {
+    const drive = parts[0].replace(":", "");
+    return `${drive}:/${parts.slice(-2).join("/")}`;
+  }
+  return pp || parts[0] || "Claude";
+}
+
 async function resumeSession(sessionId: string, projectPath: string, skipPermissions: boolean) {
   const perSession = document.querySelector(`input[data-newwin-for="${sessionId}"]`) as HTMLInputElement | null;
   const globalEl = document.getElementById("global-new-window") as HTMLInputElement | null;
   const newWindow = perSession?.checked ?? globalEl?.checked ?? false;
+  const tabTitle = buildTabTitle(sessionId);
   try {
-    await invoke("resume_session", { sessionId, projectPath, skipPermissions, newWindow });
+    await invoke("resume_session", { sessionId, projectPath, skipPermissions, newWindow, tabTitle });
   } catch (e) {
     alert("실행 실패: " + e);
   }

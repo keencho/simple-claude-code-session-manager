@@ -607,26 +607,27 @@ fn cleanup_empty_project(project_dir: &Path) {
 }
 
 #[tauri::command]
-fn resume_session(session_id: String, project_path: String, skip_permissions: bool, new_window: bool) -> Result<(), String> {
+fn resume_session(session_id: String, project_path: String, skip_permissions: bool, new_window: bool, tab_title: Option<String>) -> Result<(), String> {
     use std::process::Command;
 
     let skip_flag = if skip_permissions { " --dangerously-skip-permissions" } else { "" };
     let temp_dir = std::env::temp_dir();
     let bat_path = temp_dir.join("kcsm_resume.bat");
+    let title = tab_title.unwrap_or_else(|| "Claude Session".to_string());
     let bat_content = format!(
-        "@echo off\r\ncd /d \"{}\"\r\nclaude --resume {}{}\r\n",
-        project_path, session_id, skip_flag
+        "@echo off\r\ntitle {}\r\ncd /d \"{}\"\r\nclaude --resume {}{}\r\n",
+        title, project_path, session_id, skip_flag
     );
     fs::write(&bat_path, &bat_content).map_err(|e| e.to_string())?;
 
     if new_window {
-        Command::new("cmd")
-            .args(["/c", "start", "cmd", "/k", bat_path.to_str().unwrap_or("")])
+        Command::new("wt.exe")
+            .args(["new-tab", "--title", &title, "--suppressApplicationTitle", "--", "cmd", "/k", bat_path.to_str().unwrap_or("")])
             .spawn()
             .map_err(|e| e.to_string())?;
     } else {
         Command::new("wt.exe")
-            .args(["-w", "0", "new-tab", "cmd", "/k", bat_path.to_str().unwrap_or("")])
+            .args(["-w", "claude-session", "new-tab", "--title", &title, "--suppressApplicationTitle", "--", "cmd", "/k", bat_path.to_str().unwrap_or("")])
             .spawn()
             .map_err(|e| e.to_string())?;
     }
