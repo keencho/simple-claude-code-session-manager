@@ -11,7 +11,7 @@ interface SessionInfo {
   git_branch: string;
   project_path: string;
   project_folder: string;
-  label: string;
+  labels: string[];
   custom_title: string;
 }
 
@@ -75,7 +75,7 @@ function getFilteredSessions(): SessionInfo[] {
       !q ||
       s.first_prompt.toLowerCase().includes(q) ||
       s.summary.toLowerCase().includes(q) ||
-      s.label.toLowerCase().includes(q) ||
+      s.labels.some((l) => l.toLowerCase().includes(q)) ||
       s.custom_title.toLowerCase().includes(q) ||
       s.project_path.toLowerCase().includes(q) ||
       s.git_branch.toLowerCase().includes(q) ||
@@ -92,7 +92,7 @@ function getFilteredSessions(): SessionInfo[] {
 
     const matchesLabel =
       filterSessionLabel === null ||
-      (filterSessionLabel === "" ? !s.label : s.label === filterSessionLabel);
+      (filterSessionLabel === "" ? s.labels.length === 0 : s.labels.includes(filterSessionLabel));
 
     return matchesSearch && matchesProject && matchesLabel;
   });
@@ -155,8 +155,10 @@ function getSessionLabelsForChips(): { name: string; count: number }[] {
   const map = new Map<string, number>();
   let unlabeled = 0;
   for (const s of filtered) {
-    if (s.label) {
-      map.set(s.label, (map.get(s.label) || 0) + 1);
+    if (s.labels.length > 0) {
+      for (const l of s.labels) {
+        map.set(l, (map.get(l) || 0) + 1);
+      }
     } else {
       unlabeled++;
     }
@@ -179,7 +181,7 @@ function buildTabTitle(sessionId: string): string {
   const pp = session.project_path.replace(/\\/g, "/");
   const lastSegment = pp.split("/").filter(Boolean).pop() || "";
   const projectName = getProjectLabel(session.project_folder) || lastSegment;
-  const title = session.custom_title || session.label || session.first_prompt?.slice(0, 50) || "";
+  const title = session.custom_title || session.labels[0] || session.first_prompt?.slice(0, 50) || "";
   if (projectName && title) return `${projectName}:${title}`;
   if (projectName) return projectName;
   if (title) return title;
@@ -236,13 +238,18 @@ async function setSessionTitle(sessionId: string) {
 
 async function setSessionLabel(sessionId: string) {
   const session = allSessions.find((s) => s.session_id === sessionId);
-  const current = session?.label || "";
-  const label = prompt("세션 라벨 입력 (비우면 삭제):", current);
-  if (label === null) return;
+  const current = session?.labels.join(", ") || "";
+  const input = prompt("세션 라벨 입력 (쉼표로 구분, 비우면 삭제):", current);
+  if (input === null) return;
+
+  const labels = input
+    .split(",")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
 
   try {
-    await invoke("set_label", { sessionId, label });
-    if (session) session.label = label;
+    await invoke("set_labels", { sessionId, labels });
+    if (session) session.labels = labels;
     renderChips();
     renderList();
   } catch (e) {
@@ -279,7 +286,7 @@ async function deleteSession(sessionId: string, projectFolder: string) {
   deleteInProgress = true;
   try {
     const session = allSessions.find((s) => s.session_id === sessionId);
-    const desc = session?.custom_title || session?.label || session?.first_prompt?.slice(0, 40) || sessionId;
+    const desc = session?.custom_title || session?.labels[0] || session?.first_prompt?.slice(0, 40) || sessionId;
     const ok = await tauriConfirm(`"${desc}" 세션을 삭제할까요?`, { title: "세션 삭제", kind: "warning" });
     if (!ok) return;
 
@@ -416,9 +423,9 @@ function renderList() {
     <div class="card">
       <div class="card-top">
         <div class="card-left">
-          <span class="label-btn ${s.label ? "active" : ""}" data-action="label" data-id="${s.session_id}">
-            ${s.label ? escapeHtml(s.label) : "라벨 추가"}
-          </span>
+          ${s.labels.length > 0
+            ? s.labels.map((l) => `<span class="label-btn active" data-action="label" data-id="${s.session_id}">${escapeHtml(l)}</span>`).join("")
+            : `<span class="label-btn" data-action="label" data-id="${s.session_id}">라벨 추가</span>`}
           <span class="time">${timeAgo(s.modified)}</span>
         </div>
         <div class="card-right">

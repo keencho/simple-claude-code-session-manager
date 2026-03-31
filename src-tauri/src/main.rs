@@ -48,7 +48,7 @@ struct SessionInfo {
     git_branch: String,
     project_path: String,
     project_folder: String,
-    label: String,
+    labels: Vec<String>,
     custom_title: String,
 }
 
@@ -64,9 +64,53 @@ struct ProjectInfo {
 
 // --- Labels ---
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Clone, Default)]
 struct Labels {
-    labels: HashMap<String, String>,
+    labels: HashMap<String, Vec<String>>,
+}
+
+impl<'de> Deserialize<'de> for Labels {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Inner struct to handle the raw JSON shape
+        #[derive(Deserialize)]
+        struct RawLabels {
+            #[serde(default)]
+            labels: HashMap<String, serde_json::Value>,
+        }
+
+        let raw = RawLabels::deserialize(deserializer)?;
+        let mut labels = HashMap::new();
+        for (k, v) in raw.labels {
+            let vec = match v {
+                serde_json::Value::String(s) => {
+                    if s.is_empty() { vec![] } else { vec![s] }
+                }
+                serde_json::Value::Array(arr) => {
+                    arr.into_iter()
+                        .filter_map(|item| item.as_str().map(String::from))
+                        .collect()
+                }
+                _ => vec![],
+            };
+            labels.insert(k, vec);
+        }
+        Ok(Labels { labels })
+    }
+}
+
+impl Serialize for Labels {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("labels", &self.labels)?;
+        map.end()
+    }
 }
 
 // --- Cache ---
@@ -322,7 +366,7 @@ fn scan_project(
             .to_string_lossy()
             .to_string();
 
-        let label = labels.labels.get(&session_id).cloned().unwrap_or_default();
+        let labels_vec = labels.labels.get(&session_id).cloned().unwrap_or_default();
         let custom_title = titles.get(&session_id).cloned().unwrap_or_default();
 
         if let Some(idx) = indexed.get(&session_id) {
@@ -336,7 +380,7 @@ fn scan_project(
                 git_branch: idx.git_branch.clone().unwrap_or_default(),
                 project_path: project_path.clone(),
                 project_folder: folder_name.to_string(),
-                label,
+                labels: labels_vec,
                 custom_title,
             });
         } else {
@@ -357,7 +401,7 @@ fn scan_project(
                 git_branch: String::new(),
                 project_path: project_path.clone(),
                 project_folder: folder_name.to_string(),
-                label,
+                labels: labels_vec,
                 custom_title,
             });
         }
@@ -495,14 +539,15 @@ fn set_session_title(session_id: String, title: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_label(session_id: String, label: String) -> Result<(), String> {
-    let mut labels = load_labels();
-    if label.is_empty() {
-        labels.labels.remove(&session_id);
+fn set_labels(session_id: String, labels: Vec<String>) -> Result<(), String> {
+    let mut all_labels = load_labels();
+    let filtered: Vec<String> = labels.into_iter().filter(|l| !l.is_empty()).collect();
+    if filtered.is_empty() {
+        all_labels.labels.remove(&session_id);
     } else {
-        labels.labels.insert(session_id, label);
+        all_labels.labels.insert(session_id, filtered);
     }
-    save_labels(&labels)
+    save_labels(&all_labels)
 }
 
 #[tauri::command]
@@ -666,7 +711,7 @@ fn main() {
             get_projects,
             get_project_labels,
             set_project_label,
-            set_label,
+            set_labels,
             set_session_title,
             delete_session,
             delete_project_sessions,
