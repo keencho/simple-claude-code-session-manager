@@ -1,0 +1,6 @@
+/*
+ * Cascadia Code — sole terminal font.
+ * Latin: 번들 (@fontsource, SIL OFL). 한글은 시스템 fallback (맑은 고딕 등).
+ */
+@import "@fontsource/cascadia-code/latin-400.css";
+@import "@fontsource/cascadia-code/latin-700.css";
