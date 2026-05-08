@@ -646,20 +646,41 @@ async fn drop_tab(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
+    // Hit-test in PHYSICAL pixels via OS cursor. dragend.screenX/Y from
+    // Chromium / WebView2 is unreliable when the drop lands outside the
+    // source window (cross-window drags often report (0,0)). Querying
+    // the OS gives ground truth and physical-pixel comparison handles
+    // multi-monitor mixed-DPI setups correctly.
+    let cur_pos = app.cursor_position().ok();
+    let src_scale = app.get_webview_window(&source_label)
+        .and_then(|w| w.scale_factor().ok())
+        .unwrap_or(1.0);
+    let (cur_x, cur_y) = match cur_pos {
+        Some(p) => (p.x, p.y),
+        None => (screen_x * src_scale, screen_y * src_scale),
+    };
     for (label, window) in app.webview_windows() {
-        if !label.starts_with("term-") || label == source_label { continue; }
+        // "main" is also a valid merge target — without this, dragging a
+        // tab from a sub-window back into the main window silently fails.
+        if label != "main" && !label.starts_with("term-") { continue; }
+        if label == source_label { continue; }
         let Ok(pos) = window.outer_position() else { continue };
         let Ok(size) = window.outer_size() else { continue };
-        let Ok(scale) = window.scale_factor() else { continue };
-        let x0 = pos.x as f64 / scale; let y0 = pos.y as f64 / scale;
-        let x1 = x0 + size.width as f64 / scale; let y1 = y0 + size.height as f64 / scale;
-        if screen_x >= x0 && screen_x < x1 && screen_y >= y0 && screen_y < y1 {
+        let x0 = pos.x as f64;
+        let y0 = pos.y as f64;
+        let x1 = x0 + size.width as f64;
+        let y1 = y0 + size.height as f64;
+        if cur_x >= x0 && cur_x < x1 && cur_y >= y0 && cur_y < y1 {
             window.emit_to(label.as_str(), "merge-tab", MergeTabPayload { terminal_id, title, ssh_args, cwd, initial_content, screen_x, screen_y }).map_err(|e| e.to_string())?;
             let _ = window.set_focus();
             return Ok(true);
         }
     }
-    if is_last_tab { return Ok(false); }
+    // Block the "detach into a clone" case for term-* sources — moving
+    // the only tab out of a sub-window into a fresh window of the same
+    // kind is a no-op. Main keeps a placeholder when its last tab leaves,
+    // so detaching from main is meaningful.
+    if is_last_tab && source_label.starts_with("term-") { return Ok(false); }
     let label = format!("term-{}", Uuid::new_v4().simple());
     let payload = AddTabPayload { terminal_id, title: title.clone(), ssh_args, cwd, adopt: true, initial_content };
     state.pending_tabs.lock().unwrap().insert(label.clone(), payload);
