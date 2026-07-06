@@ -225,7 +225,8 @@ interface _UsageTotals { input: number; output: number; cache_read: number; cach
 interface _SessionUsage { session_id: string; model: string | null; totals: _UsageTotals; duration_min: number; first_ts: string | null; last_ts: string | null; }
 interface _UsageReport { today: _UsageTotals; week: _UsageTotals; all_time: _UsageTotals; by_model_today: Record<string, _UsageTotals>; by_model_week: Record<string, _UsageTotals>; active_session: _SessionUsage | null; }
 interface _OauthQuota { utilization: number; resets_at: string | null; }
-interface _OauthUsage { fiveHour: _OauthQuota; sevenDay: _OauthQuota; sevenDaySonnet: _OauthQuota; }
+interface _ScopedQuota { label: string | null; utilization: number; resets_at: string | null; }
+interface _OauthUsage { fiveHour: _OauthQuota; sevenDay: _OauthQuota; sevenDaySonnet: _OauthQuota | null; sevenDayScoped?: _ScopedQuota | null; }
 
 let _statusUsage: _UsageReport | null = null;
 let _statusOauth: _OauthUsage | null = null;
@@ -274,6 +275,7 @@ function _modelColor(m: string | null): string {
   if (m === "sonnet") return "var(--blue, #4593fc)";
   if (m === "opus") return "#a78bfa";
   if (m === "haiku") return "#22c55e";
+  if (m === "fable") return "#fb7185";
   return "var(--fg-dim)";
 }
 function _pctColor(pct: number): string {
@@ -348,6 +350,18 @@ function renderStatusBar() {
         ${wClock ? `<span class="sb-clock">${wClock}</span>` : ""}
       </div>
     `);
+    const sc = _statusOauth.sevenDayScoped;
+    if (sc) {
+      const scClock = _fmtTime(sc.resets_at);
+      parts.push(`
+      <div class="sb-block sb-ratelimit" title="${_fmtReset(sc.resets_at)}">
+        <span class="sb-label">주간 ${sc.label || "모델"}</span>
+        <span class="sb-bar"><span class="sb-bar-fill" style="width:${Math.min(100, sc.utilization)}%; background:${_pctColor(sc.utilization)}"></span></span>
+        <span class="sb-value">${Math.round(sc.utilization)}%</span>
+        ${scClock ? `<span class="sb-clock">${scClock}</span>` : ""}
+      </div>
+    `);
+    }
   }
   statusBarEl.innerHTML = parts.join('<span class="sb-sep"></span>') || `<span class="sb-empty">세션을 열면 사용량이 표시됩니다</span>`;
 }

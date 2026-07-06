@@ -1038,6 +1038,7 @@ fn normalize_model(m: &Option<String>) -> Option<String> {
     if s.contains("sonnet") { Some("sonnet".into()) }
     else if s.contains("opus") { Some("opus".into()) }
     else if s.contains("haiku") { Some("haiku".into()) }
+    else if s.contains("fable") { Some("fable".into()) }
     else { None }
 }
 
@@ -1269,6 +1270,16 @@ pub struct OauthQuota {
     #[serde(alias = "resetsAt")]
     pub resets_at: Option<String>,
 }
+// Weekly quota scoped to a specific model (e.g. "Fable"). Since the Claude 5
+// rollout the API reports this via the `limits` array (kind = "weekly_scoped")
+// instead of the old fixed `seven_day_sonnet` field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopedQuota {
+    pub label: Option<String>,
+    pub utilization: f64,
+    pub resets_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OauthUsage {
@@ -1276,8 +1287,72 @@ pub struct OauthUsage {
     pub five_hour: OauthQuota,
     #[serde(alias = "seven_day")]
     pub seven_day: OauthQuota,
-    #[serde(alias = "seven_day_sonnet")]
-    pub seven_day_sonnet: OauthQuota,
+    // Nullable since the Claude 5 rollout (2026-07): the API now sends null here.
+    #[serde(alias = "seven_day_sonnet", default)]
+    pub seven_day_sonnet: Option<OauthQuota>,
+    #[serde(alias = "seven_day_scoped", default)]
+    pub seven_day_scoped: Option<ScopedQuota>,
+}
+
+// Raw shape of GET /api/oauth/usage. Every field optional so future schema
+// changes degrade gracefully instead of failing the whole poll.
+#[derive(Deserialize)]
+struct ApiOauthUsage {
+    five_hour: Option<OauthQuota>,
+    seven_day: Option<OauthQuota>,
+    seven_day_sonnet: Option<OauthQuota>,
+    #[serde(default)]
+    limits: Vec<ApiLimit>,
+}
+
+#[derive(Deserialize)]
+struct ApiLimit {
+    kind: Option<String>,
+    percent: Option<f64>,
+    resets_at: Option<String>,
+    scope: Option<ApiLimitScope>,
+}
+
+#[derive(Deserialize)]
+struct ApiLimitScope {
+    model: Option<ApiLimitScopeModel>,
+}
+
+#[derive(Deserialize)]
+struct ApiLimitScopeModel {
+    display_name: Option<String>,
+}
+
+impl ApiOauthUsage {
+    fn limit(&self, kind: &str) -> Option<&ApiLimit> {
+        self.limits.iter().find(|l| l.kind.as_deref() == Some(kind))
+    }
+
+    fn into_usage(self) -> Result<OauthUsage, String> {
+        let from_limit = |l: &ApiLimit| OauthQuota {
+            utilization: l.percent.unwrap_or(0.0),
+            resets_at: l.resets_at.clone(),
+        };
+        let five_hour = self.five_hour.clone()
+            .or_else(|| self.limit("session").map(from_limit))
+            .ok_or("응답에 5시간(session) 한도 없음 — API 스키마 변경 가능")?;
+        let seven_day = self.seven_day.clone()
+            .or_else(|| self.limit("weekly_all").map(from_limit))
+            .ok_or("응답에 주간(weekly_all) 한도 없음 — API 스키마 변경 가능")?;
+        let seven_day_scoped = self.limit("weekly_scoped").map(|l| ScopedQuota {
+            label: l.scope.as_ref()
+                .and_then(|s| s.model.as_ref())
+                .and_then(|m| m.display_name.clone()),
+            utilization: l.percent.unwrap_or(0.0),
+            resets_at: l.resets_at.clone(),
+        });
+        Ok(OauthUsage {
+            five_hour,
+            seven_day,
+            seven_day_sonnet: self.seven_day_sonnet,
+            seven_day_scoped,
+        })
+    }
 }
 
 fn oauth_cache_path() -> Option<PathBuf> {
@@ -1351,7 +1426,8 @@ async fn fetch_oauth_usage_for_account(account: &Account) -> Result<OauthUsage, 
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("API {}: {}", status, body));
     }
-    resp.json::<OauthUsage>().await.map_err(|e| format!("JSON 파싱 실패: {}", e))
+    let raw = resp.json::<ApiOauthUsage>().await.map_err(|e| format!("JSON 파싱 실패: {}", e))?;
+    raw.into_usage()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1931,4 +2007,75 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Captured from the live endpoint on 2026-07-06 (Claude 5 era): the old
+    // seven_day_sonnet field is null and scoped weekly moved into `limits`.
+    #[test]
+    fn oauth_usage_parses_claude5_schema() {
+        let json = r#"{
+            "five_hour": {"utilization": 10.0, "resets_at": "2026-07-06T04:10:00.165913+00:00", "limit_dollars": null},
+            "seven_day": {"utilization": 55.0, "resets_at": "2026-07-09T02:00:00.165937+00:00"},
+            "seven_day_sonnet": null,
+            "seven_day_opus": null,
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 10, "severity": "normal", "resets_at": "2026-07-06T04:10:00.165913+00:00", "scope": null, "is_active": false},
+                {"kind": "weekly_all", "group": "weekly", "percent": 55, "severity": "normal", "resets_at": "2026-07-09T02:00:00.165937+00:00", "scope": null, "is_active": false},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 69, "severity": "normal", "resets_at": "2026-07-09T02:00:00.166177+00:00", "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}, "is_active": true}
+            ],
+            "extra_usage": {"is_enabled": false},
+            "spend": {"percent": 0}
+        }"#;
+        let usage = serde_json::from_str::<ApiOauthUsage>(json).unwrap().into_usage().unwrap();
+        assert_eq!(usage.five_hour.utilization, 10.0);
+        assert_eq!(usage.seven_day.utilization, 55.0);
+        assert!(usage.seven_day_sonnet.is_none());
+        let scoped = usage.seven_day_scoped.expect("weekly_scoped 파싱돼야 함");
+        assert_eq!(scoped.label.as_deref(), Some("Fable"));
+        assert_eq!(scoped.utilization, 69.0);
+        assert!(scoped.resets_at.is_some());
+    }
+
+    // Pre-Claude5 schema: seven_day_sonnet present, no limits array.
+    #[test]
+    fn oauth_usage_parses_legacy_schema() {
+        let json = r#"{
+            "five_hour": {"utilization": 0.0, "resets_at": null},
+            "seven_day": {"utilization": 53.0, "resets_at": "2026-07-02T01:59:59+00:00"},
+            "seven_day_sonnet": {"utilization": 7.0, "resets_at": "2026-07-02T01:59:59+00:00"}
+        }"#;
+        let usage = serde_json::from_str::<ApiOauthUsage>(json).unwrap().into_usage().unwrap();
+        assert_eq!(usage.seven_day.utilization, 53.0);
+        assert_eq!(usage.seven_day_sonnet.unwrap().utilization, 7.0);
+        assert!(usage.seven_day_scoped.is_none());
+    }
+
+    // Old on-disk cache (camelCase, no new fields) must still deserialize so a
+    // stale cache never breaks startup.
+    #[test]
+    fn oauth_usage_cache_roundtrip_and_legacy_cache() {
+        let legacy_cache = r#"{"fiveHour":{"utilization":0.0,"resets_at":null},"sevenDay":{"utilization":53.0,"resets_at":"2026-07-02T01:59:59+00:00"},"sevenDaySonnet":{"utilization":7.0,"resets_at":"2026-07-02T01:59:59+00:00"}}"#;
+        let parsed = serde_json::from_str::<OauthUsage>(legacy_cache).unwrap();
+        assert_eq!(parsed.seven_day.utilization, 53.0);
+
+        let modern = OauthUsage {
+            five_hour: OauthQuota { utilization: 10.0, resets_at: None },
+            seven_day: OauthQuota { utilization: 55.0, resets_at: None },
+            seven_day_sonnet: None,
+            seven_day_scoped: Some(ScopedQuota { label: Some("Fable".into()), utilization: 69.0, resets_at: None }),
+        };
+        let roundtrip: OauthUsage = serde_json::from_str(&serde_json::to_string(&modern).unwrap()).unwrap();
+        assert_eq!(roundtrip.seven_day_scoped.unwrap().label.as_deref(), Some("Fable"));
+    }
+
+    #[test]
+    fn normalize_model_recognizes_fable() {
+        assert_eq!(normalize_model(&Some("claude-fable-5".into())).as_deref(), Some("fable"));
+        assert_eq!(normalize_model(&Some("claude-sonnet-5".into())).as_deref(), Some("sonnet"));
+        assert_eq!(normalize_model(&Some("unknown-model".into())), None);
+    }
 }

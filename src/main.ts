@@ -115,10 +115,17 @@ interface OauthQuota {
   utilization: number;
   resets_at: string | null;
 }
+interface ScopedQuota {
+  label: string | null;
+  utilization: number;
+  resets_at: string | null;
+}
 interface OauthUsage {
   fiveHour: OauthQuota;
   sevenDay: OauthQuota;
-  sevenDaySonnet: OauthQuota;
+  // Claude 5 롤아웃 이후 null. 모델별 주간 한도는 sevenDayScoped 로 옴.
+  sevenDaySonnet: OauthQuota | null;
+  sevenDayScoped?: ScopedQuota | null;
 }
 
 let allSessions: SessionInfo[] = [];
@@ -307,6 +314,7 @@ function modelDotColor(model: string | null): string {
   if (model === "sonnet") return "var(--blue)";
   if (model === "opus") return "#a78bfa";
   if (model === "haiku") return "var(--green, #22c55e)";
+  if (model === "fable") return "#fb7185";
   return "var(--text-tertiary)";
 }
 
@@ -475,8 +483,14 @@ function renderUsagePanelIfOpen(report?: UsageReport | null) {
     const rows: [string, OauthQuota][] = [
       ["세션 (5시간)", oauth.fiveHour],
       ["주간 (전체)", oauth.sevenDay],
-      ["주간 Sonnet", oauth.sevenDaySonnet],
     ];
+    if (oauth.sevenDayScoped) {
+      rows.push([
+        `주간 ${oauth.sevenDayScoped.label || "모델별"}`,
+        { utilization: oauth.sevenDayScoped.utilization, resets_at: oauth.sevenDayScoped.resets_at },
+      ]);
+    }
+    if (oauth.sevenDaySonnet) rows.push(["주간 Sonnet", oauth.sevenDaySonnet]);
     oauthHtml = `
       <div class="usage-ratelimit-block">
         <div class="usage-ratelimit-title">Rate Limit <span class="usage-ratelimit-source">Anthropic · /usage</span></div>
