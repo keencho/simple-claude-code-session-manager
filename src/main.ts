@@ -59,7 +59,31 @@ interface SessionInfo {
   project_folder: string;
   labels: string[];
   custom_title: string;
+  account_name?: string;
 }
+
+interface Account {
+  name: string;
+  config_dir?: string | null;
+  alias?: string | null;
+  email?: string | null;
+  subscription?: string | null;
+  org_name?: string | null;
+  logged_in?: boolean;
+}
+
+interface AccountOauthUsage {
+  account_name: string;
+  alias?: string | null;
+  email?: string | null;
+  subscription?: string | null;
+  org_name?: string | null;
+  logged_in?: boolean;
+  usage?: OauthUsage | null;
+  error?: string | null;
+}
+
+const DEFAULT_ACCOUNT_NAME = "default";
 
 // --- State ---
 
@@ -103,7 +127,38 @@ let favoriteSessions: Set<string> = new Set();
 let lastUsageReport: UsageReport | null = null;
 let lastOauthUsage: OauthUsage | null = null;
 let lastOauthError: string | null = null;
+let allAccounts: Account[] = [];
+let labelAccountMap: Record<string, string> = {};
+let sessionAccountMap: Record<string, string> = {};
+let lastOauthMulti: AccountOauthUsage[] = [];
 let searchQuery = "";
+
+// Resolve the account used for a session. Priority:
+// 1. explicit session→account mapping
+// 2. any label→account mapping match
+// 3. session_info.account_name (where its jsonl actually lives)
+// 4. "default"
+function resolveSessionAccountName(s: SessionInfo | undefined, sessionId?: string): string {
+  const sid = sessionId || s?.session_id;
+  if (sid && sessionAccountMap[sid]) return sessionAccountMap[sid];
+  if (s) {
+    for (const l of s.labels) {
+      if (labelAccountMap[l]) return labelAccountMap[l];
+    }
+  }
+  if (s?.account_name) return s.account_name;
+  return DEFAULT_ACCOUNT_NAME;
+}
+
+function accountDisplay(acc: Account): string {
+  if (acc.alias && acc.alias.trim()) return acc.alias;
+  if (acc.email && acc.email.includes("@")) return acc.email.split("@")[0];
+  return acc.name;
+}
+
+function accountByName(name: string): Account | undefined {
+  return allAccounts.find((a) => a.name === name);
+}
 const COLLAPSED_STORAGE_KEY = "kc-collapsed-projects";
 function loadCollapsed(): Set<string> {
   try {
@@ -266,11 +321,64 @@ function pctColor(pct: number): string {
   return "var(--accent)";
 }
 
+// Helper: per-account utilization pill. Compact, one chip per account.
+function renderAccountUsageChip(a: AccountOauthUsage): string {
+  const acc: Account = {
+    name: a.account_name,
+    alias: a.alias,
+    email: a.email,
+    subscription: a.subscription,
+    org_name: a.org_name,
+    logged_in: a.logged_in,
+  };
+  const display = accountDisplay(acc);
+  const tipParts: string[] = [];
+  if (a.email) tipParts.push(a.email);
+  if (a.subscription) tipParts.push(a.subscription);
+  if (a.org_name) tipParts.push(a.org_name);
+  const tip = tipParts.join(" · ") || a.account_name;
+
+  if (a.error || !a.usage) {
+    const msg = a.error ? a.error : "로그인 필요";
+    return `<span class="usage-account is-error" title="${escapeHtml(display + " — " + msg)}">
+      <span class="usage-account-name">${escapeHtml(display)}</span>
+      <span class="usage-account-err">!</span>
+    </span>`;
+  }
+
+  const f = Math.round(a.usage.fiveHour.utilization);
+  const w = Math.round(a.usage.sevenDay.utilization);
+  const fillColor = pctColor(Math.max(f, w));
+  return `<span class="usage-account" title="${escapeHtml(tip)}">
+    <span class="usage-account-dot" style="background:${fillColor}"></span>
+    <span class="usage-account-name">${escapeHtml(display)}</span>
+    <span class="usage-account-pct">${f}%<span class="usage-account-pct-sep">/</span>${w}%</span>
+  </span>`;
+}
+
 function renderUsageStatus(_report: UsageReport | null) {
   const el = document.getElementById("usage-status");
   if (!el) return;
   const report = _report;
-  const oauth = lastOauthUsage;
+
+  // Decide what to display. Prefer the multi-account data when present, fall
+  // back to the legacy single-account oauth payload so we still work even
+  // before the first multi-account poll fires.
+  let accountChips: AccountOauthUsage[] = lastOauthMulti.length > 0
+    ? lastOauthMulti
+    : [];
+  if (accountChips.length === 0 && lastOauthUsage) {
+    const a = allAccounts[0];
+    accountChips = [{
+      account_name: a?.name || DEFAULT_ACCOUNT_NAME,
+      alias: a?.alias,
+      email: a?.email,
+      subscription: a?.subscription,
+      org_name: a?.org_name,
+      logged_in: a?.logged_in,
+      usage: lastOauthUsage,
+    }];
+  }
 
   let html = "";
 
@@ -287,22 +395,10 @@ function renderUsageStatus(_report: UsageReport | null) {
     </div>`;
   }
 
-  // Rate limit bars (from Anthropic OAuth endpoint, updates every 60s)
-  if (oauth) {
-    const fiveH = oauth.fiveHour;
-    const sevenD = oauth.sevenDay;
-    html += `<div class="usage-rate">
-      <div class="usage-rate-row" title="${escapeHtml(formatResetCountdown(fiveH.resets_at))}">
-        <span class="usage-rate-label">5h</span>
-        ${pctBar(fiveH.utilization, pctColor(fiveH.utilization))}
-        <span class="usage-rate-pct">${Math.round(fiveH.utilization)}%</span>
-      </div>
-      <div class="usage-rate-row" title="${escapeHtml(formatResetCountdown(sevenD.resets_at))}">
-        <span class="usage-rate-label">주간</span>
-        ${pctBar(sevenD.utilization, pctColor(sevenD.utilization))}
-        <span class="usage-rate-pct">${Math.round(sevenD.utilization)}%</span>
-      </div>
-    </div>`;
+  // Multi-account rate-limit pills (compact, one per registered account).
+  if (accountChips.length > 0) {
+    const pills = accountChips.map(renderAccountUsageChip).join("");
+    html += `<div class="usage-accounts">${pills}</div>`;
   } else if (lastOauthError) {
     html += `<div class="usage-rate-error" title="${escapeHtml(lastOauthError)}">rate limit 조회 실패</div>`;
   }
@@ -801,9 +897,14 @@ async function resumeSession(
   projectFolder: string,
   newWindow: boolean,
   model?: string,
+  account?: string,
 ) {
   const title = buildTabTitle(sessionId, projectPath, projectFolder);
   hideWelcome();
+  // If caller didn't pin an account, resolve from explicit/label/info mappings
+  // so the right CLAUDE_CONFIG_DIR is used to find the session's jsonl.
+  const s = allSessions.find((x) => x.session_id === sessionId);
+  const finalAccount = account ?? resolveSessionAccountName(s, sessionId);
   try {
     await invoke("open_session", {
       sessionId,
@@ -812,6 +913,7 @@ async function resumeSession(
       newWindow,
       title,
       model: model ?? null,
+      account: finalAccount,
     });
     void refreshUsage();
   } catch (e) {
@@ -825,6 +927,7 @@ async function startNewSessionInProject(
   projectFolder: string,
   newWindow: boolean,
   model?: string,
+  account?: string,
 ) {
   const title = buildTabTitle(null, projectPath, projectFolder);
   hideWelcome();
@@ -836,6 +939,7 @@ async function startNewSessionInProject(
       newWindow,
       title,
       model: model ?? null,
+      account: account ?? null,
     });
   } catch (e) {
     await customAlert("실행 실패: " + e);
@@ -843,7 +947,45 @@ async function startNewSessionInProject(
   }
 }
 
-async function openClaudeHere(newWindow: boolean) {
+async function resumeWithAccountPicker(sessionId: string, projectPath: string, projectFolder: string) {
+  const picked = await customAccountPicker(allAccounts);
+  if (!picked) return;
+  await resumeSession(sessionId, projectPath, projectFolder, globalNewWindow, undefined, picked);
+}
+
+async function startWithAccountPicker(projectPath: string, projectFolder: string) {
+  const picked = await customAccountPicker(allAccounts);
+  if (!picked) return;
+  await startNewSessionInProject(projectPath, projectFolder, globalNewWindow, undefined, picked);
+}
+
+async function pinSessionAccount(sessionId: string) {
+  const current = sessionAccountMap[sessionId];
+  const currentDisplay = current
+    ? (accountByName(current) ? accountDisplay(accountByName(current)!) : current)
+    : "(자동)";
+  const ok = await customConfirm(
+    `현재 고정: ${currentDisplay}\n\n새 계정을 선택해 고정하거나 취소해 자동(라벨 매핑/기본)으로 되돌립니다.`,
+    "세션 계정 고정",
+    false
+  );
+  if (!ok) {
+    // Cancel = clear pin
+    try {
+      sessionAccountMap = await invoke("set_session_account_mapping", { sessionId, account: null });
+      renderTree();
+    } catch (err) { await customAlert("실패: " + err); }
+    return;
+  }
+  const picked = await customAccountPicker(allAccounts);
+  if (!picked) return;
+  try {
+    sessionAccountMap = await invoke("set_session_account_mapping", { sessionId, account: picked });
+    renderTree();
+  } catch (err) { await customAlert("실패: " + err); }
+}
+
+async function openClaudeHere(newWindow: boolean, account?: string) {
   const selected = await open({ directory: true, multiple: false, title: "Claude를 열 폴더 선택" });
   if (!selected) return;
   const path = typeof selected === "string" ? selected : String(selected);
@@ -856,6 +998,7 @@ async function openClaudeHere(newWindow: boolean) {
       newWindow,
       title: lastPathSegment(path) || "Claude",
       model: null,
+      account: account ?? null,
     });
   } catch (e) {
     await customAlert("실행 실패: " + e);
@@ -952,7 +1095,7 @@ async function deleteGroupSessions(label: string) {
   if (!ok) return;
   try {
     for (const f of folders) {
-      await invoke("delete_project_sessions", { projectFolder: f });
+      await invoke("delete_project_sessions", { projectFolder: f, accountName: null });
       delete projectLabels[f];
     }
     allSessions = allSessions.filter((s) => !folders.includes(s.project_folder));
@@ -972,7 +1115,7 @@ async function deleteSession(sessionId: string, projectFolder: string) {
     const desc = s?.custom_title || s?.labels[0] || s?.first_prompt?.slice(0, 40) || sessionId;
     const ok = await customConfirm(`"${desc}" 세션을 삭제할까요?`, "세션 삭제", true);
     if (!ok) return;
-    await invoke("delete_session", { sessionId, projectFolder });
+    await invoke("delete_session", { sessionId, projectFolder, accountName: s?.account_name ?? null });
     allSessions = allSessions.filter((x) => x.session_id !== sessionId);
     renderChips();
     renderTree();
@@ -994,7 +1137,7 @@ async function deleteProjectSessions(folder: string, path: string) {
   );
   if (!ok) return;
   try {
-    await invoke("delete_project_sessions", { projectFolder: folder });
+    await invoke("delete_project_sessions", { projectFolder: folder, accountName: null });
     allSessions = allSessions.filter((s) => s.project_folder !== folder);
     delete projectLabels[folder];
     renderChips();
@@ -1020,11 +1163,26 @@ function renderSessionRow(s: SessionInfo, showPathHint = false): string {
     : "";
   const isFav = favoriteSessions.has(s.session_id);
   const favIcon = isFav ? `<span class="session-fav">${ICONS.star}</span>` : "";
+
+  // Account badge — show only when not the default account, since the vast
+  // majority of sessions live there. Tooltip carries the email/subscription.
+  const resolvedAcc = resolveSessionAccountName(s);
+  let accountBadge = "";
+  if (resolvedAcc !== DEFAULT_ACCOUNT_NAME) {
+    const acc = accountByName(resolvedAcc);
+    const display = acc ? accountDisplay(acc) : resolvedAcc;
+    const tip = acc && acc.email
+      ? `${acc.email}${acc.subscription ? " · " + acc.subscription : ""}`
+      : resolvedAcc;
+    accountBadge = `<span class="session-account" title="${escapeHtml(tip)}">${escapeHtml(display)}</span>`;
+  }
+
   return `
-    <div class="tree-session ${isFav ? "is-favorite" : ""}" data-session-id="${s.session_id}" data-project-folder="${escapeHtml(s.project_folder)}" data-project-path="${escapeHtml(s.project_path)}">
+    <div class="tree-session ${isFav ? "is-favorite" : ""}" data-session-id="${s.session_id}" data-project-folder="${escapeHtml(s.project_folder)}" data-project-path="${escapeHtml(s.project_path)}" data-account-name="${escapeHtml(s.account_name || "")}">
       <div class="session-title">${favIcon}${escapeHtml(title)}</div>
       <div class="session-meta">
         ${pathHint}
+        ${accountBadge}
         ${labels}
         ${branch}
         <span class="session-time">${timeAgo(s.modified)}</span>
@@ -1254,6 +1412,7 @@ async function openSettings() {
       <div class="settings-body">
         <aside class="settings-nav">
           <button class="settings-nav-item active" data-section="usage">사용량</button>
+          <button class="settings-nav-item" data-section="accounts">계정</button>
           <button class="settings-nav-item" data-section="theme">테마</button>
           <button class="settings-nav-item" data-section="layout">외관</button>
           <button class="settings-nav-item" data-section="log">로그</button>
@@ -1264,6 +1423,26 @@ async function openSettings() {
             <div class="settings-panel-title">사용량</div>
             <div class="settings-panel-subtitle">Claude Code는 rate limit 기반 구독제입니다. 토큰 누적과 모델 비율이 중요합니다.</div>
             <div id="usage-panel-body"></div>
+          </section>
+          <section class="settings-panel" data-section="accounts" hidden>
+            <div class="settings-panel-title">계정</div>
+            <div class="settings-panel-subtitle">세션마다 다른 Claude 계정을 사용할 수 있습니다. 계정은 자체 <code>CLAUDE_CONFIG_DIR</code>을 가지며, 로그인은 그 디렉토리에서 별도로 진행됩니다.</div>
+
+            <div class="settings-row-label">등록된 계정</div>
+            <div id="accounts-list" class="accounts-list"></div>
+            <div class="settings-btn-row">
+              <button class="btn-secondary-sm" id="add-account-btn">${ICONS.plus}<span>계정 추가</span></button>
+              <button class="btn-secondary-sm" id="refresh-accounts-btn">${ICONS.refresh}<span>전체 새로고침</span></button>
+            </div>
+
+            <div class="settings-divider"></div>
+
+            <div class="settings-row-label">라벨 → 계정 자동 매핑</div>
+            <div class="settings-panel-subtitle">특정 라벨이 붙은 세션은 자동으로 매핑된 계정에서 resume됩니다.</div>
+            <div id="label-mappings" class="label-mappings"></div>
+            <div class="settings-btn-row">
+              <button class="btn-secondary-sm" id="add-label-mapping-btn">${ICONS.plus}<span>매핑 추가</span></button>
+            </div>
           </section>
           <section class="settings-panel" data-section="theme" hidden>
             <div class="settings-panel-title">터미널 테마</div>
@@ -1462,10 +1641,222 @@ async function openSettings() {
   // Initial usage panel render (modal default section is "usage").
   void refreshUsage();
 
+  // Accounts section
+  const accountsListEl = overlay.querySelector("#accounts-list") as HTMLElement;
+  const labelMappingsEl = overlay.querySelector("#label-mappings") as HTMLElement;
+
+  function renderAccountsListUi() {
+    if (!accountsListEl) return;
+    accountsListEl.innerHTML = allAccounts.map((a) => {
+      const display = accountDisplay(a);
+      const isDefault = a.name === DEFAULT_ACCOUNT_NAME;
+      const statusBits: string[] = [];
+      if (a.email) statusBits.push(`<span class="account-email">${escapeHtml(a.email)}</span>`);
+      if (a.subscription) statusBits.push(`<span class="account-sub">${escapeHtml(a.subscription)}</span>`);
+      const status = statusBits.length > 0
+        ? statusBits.join(" · ")
+        : `<span class="account-warning">로그인 안 됨</span>`;
+      return `
+        <div class="account-card" data-account-name="${escapeHtml(a.name)}">
+          <div class="account-row-main">
+            <div class="account-name-row">
+              <span class="account-name">${escapeHtml(display)}</span>
+              ${isDefault ? '<span class="account-tag">기본</span>' : ''}
+              ${a.alias ? `<span class="account-id">${escapeHtml(a.name)}</span>` : ""}
+            </div>
+            <div class="account-meta">${status}</div>
+          </div>
+          <div class="account-actions">
+            ${!a.logged_in && !isDefault ? `<button class="btn-secondary-sm" data-action="login">로그인</button>` : ""}
+            <button class="btn-ghost-sm" data-action="alias" title="별명 편집">${ICONS.edit}</button>
+            <button class="btn-ghost-sm" data-action="refresh" title="상태 새로고침">${ICONS.refresh}</button>
+            ${!isDefault ? `<button class="btn-ghost-sm" data-action="delete" title="계정 삭제">${ICONS.trash}</button>` : ""}
+          </div>
+        </div>
+      `;
+    }).join("");
+  }
+
+  function renderLabelMappingsUi() {
+    if (!labelMappingsEl) return;
+    const entries = Object.entries(labelAccountMap);
+    if (entries.length === 0) {
+      labelMappingsEl.innerHTML = `<div class="label-mappings-empty">매핑이 없습니다</div>`;
+      return;
+    }
+    labelMappingsEl.innerHTML = entries.map(([label, accountName]) => {
+      const acc = accountByName(accountName);
+      const display = acc ? accountDisplay(acc) : accountName;
+      return `
+        <div class="label-mapping-row" data-label="${escapeHtml(label)}">
+          <span class="label-mapping-label">${escapeHtml(label)}</span>
+          <span class="label-mapping-arrow">→</span>
+          <span class="label-mapping-account">${escapeHtml(display)}<span class="label-mapping-id">${escapeHtml(accountName)}</span></span>
+          <button class="btn-ghost-sm" data-mapping-action="delete" title="매핑 삭제">${ICONS.trash}</button>
+        </div>
+      `;
+    }).join("");
+  }
+
+  accountsListEl.addEventListener("click", async (e) => {
+    const btn = (e.target as HTMLElement).closest("button[data-action]") as HTMLButtonElement | null;
+    if (!btn) return;
+    const card = btn.closest("[data-account-name]") as HTMLElement;
+    if (!card) return;
+    const name = card.dataset.accountName!;
+    const action = btn.dataset.action;
+    try {
+      if (action === "alias") {
+        const acc = accountByName(name);
+        const aliasInput = await customPrompt("별명 (비우면 이메일/이름 자동):", acc?.alias || "");
+        if (aliasInput === null) return;
+        const aliasVal = aliasInput.trim() || null;
+        allAccounts = await invoke("set_account_alias", { name, alias: aliasVal });
+        renderAccountsListUi();
+        renderLabelMappingsUi();
+        renderUsageStatus(lastUsageReport);
+        renderTree();
+      } else if (action === "refresh") {
+        allAccounts = await invoke("refresh_account_info", { name });
+        renderAccountsListUi();
+        renderUsageStatus(lastUsageReport);
+      } else if (action === "delete") {
+        const ok = await customConfirm(
+          `계정 "${name}"을 매니저에서 제거할까요?\nClaude 자격증명 디렉토리 자체는 디스크에 남습니다.`,
+          "계정 삭제", true);
+        if (!ok) return;
+        await invoke("remove_account", { name });
+        allAccounts = await invoke("get_accounts");
+        labelAccountMap = await invoke("get_label_account_map");
+        renderAccountsListUi();
+        renderLabelMappingsUi();
+        renderUsageStatus(lastUsageReport);
+        renderTree();
+      } else if (action === "login") {
+        await invoke("open_login_session_for_account", { accountName: name });
+        await customAlert(
+          "새 창이 열렸습니다.\n안에서 /login 을 실행하고 OAuth 인증을 마친 뒤,\n창을 닫고 여기서 '상태 새로고침'을 눌러주세요."
+        );
+      }
+    } catch (err) {
+      await customAlert("실패: " + err);
+    }
+  });
+
+  overlay.querySelector("#add-account-btn")!.addEventListener("click", async () => {
+    const name = await customPrompt(
+      "계정 이름 (디렉토리/식별자로 쓰입니다, 예: tradelab, work, personal):",
+      ""
+    );
+    if (name === null) return;
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    try {
+      allAccounts = await invoke("add_account", { name: trimmed, alias: null, configDir: null });
+      renderAccountsListUi();
+      await customAlert(
+        `계정 "${trimmed}" 추가됨.\n\n다음 단계:\n1. 행에서 '로그인' 클릭\n2. 새 창에서 /login 실행\n3. 인증 후 창 닫고 '상태 새로고침' 클릭`
+      );
+    } catch (err) {
+      await customAlert("실패: " + err);
+    }
+  });
+
+  overlay.querySelector("#refresh-accounts-btn")!.addEventListener("click", async () => {
+    try {
+      allAccounts = await invoke("refresh_all_accounts");
+      renderAccountsListUi();
+      renderUsageStatus(lastUsageReport);
+    } catch (err) {
+      await customAlert("실패: " + err);
+    }
+  });
+
+  labelMappingsEl.addEventListener("click", async (e) => {
+    const btn = (e.target as HTMLElement).closest("button[data-mapping-action]") as HTMLButtonElement | null;
+    if (!btn) return;
+    const row = btn.closest("[data-label]") as HTMLElement;
+    if (!row) return;
+    const label = row.dataset.label!;
+    if (btn.dataset.mappingAction === "delete") {
+      try {
+        labelAccountMap = await invoke("set_label_account_mapping", { label, account: null });
+        renderLabelMappingsUi();
+        renderTree();
+      } catch (err) {
+        await customAlert("실패: " + err);
+      }
+    }
+  });
+
+  overlay.querySelector("#add-label-mapping-btn")!.addEventListener("click", async () => {
+    const labelStr = await customPrompt("라벨 이름 (이 라벨이 붙은 세션에 자동 적용):", "");
+    if (labelStr === null) return;
+    const label = labelStr.trim();
+    if (!label) return;
+    const nonDefault = allAccounts.filter((a) => a.name !== DEFAULT_ACCOUNT_NAME);
+    if (nonDefault.length === 0) {
+      await customAlert("기본 계정 외 등록된 계정이 없습니다. 먼저 계정을 추가해주세요.");
+      return;
+    }
+    const accountName = await customAccountPicker(allAccounts);
+    if (!accountName) return;
+    try {
+      labelAccountMap = await invoke("set_label_account_mapping", { label, account: accountName });
+      renderLabelMappingsUi();
+      renderTree();
+    } catch (err) {
+      await customAlert("실패: " + err);
+    }
+  });
+
+  renderAccountsListUi();
+  renderLabelMappingsUi();
+
   const esc = (e: KeyboardEvent) => {
     if (e.key === "Escape") { close(); document.removeEventListener("keydown", esc); }
   };
   document.addEventListener("keydown", esc);
+}
+
+function customAccountPicker(accounts: Account[]): Promise<string | null> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "dialog-overlay";
+    const options = accounts.map((a) => {
+      const display = accountDisplay(a);
+      const meta = a.email
+        ? a.email + (a.subscription ? " · " + a.subscription : "")
+        : (a.logged_in ? "" : "로그인 안 됨");
+      const tag = a.name === DEFAULT_ACCOUNT_NAME ? '<span class="account-tag">기본</span>' : "";
+      return `<button class="account-picker-row" data-name="${escapeHtml(a.name)}">
+        <span class="account-picker-main">
+          <span class="account-picker-name">${escapeHtml(display)} ${tag}</span>
+          ${meta ? `<span class="account-picker-meta">${escapeHtml(meta)}</span>` : ""}
+        </span>
+      </button>`;
+    }).join("");
+    overlay.innerHTML = `
+      <div class="dialog-box" style="min-width:340px">
+        <div class="dialog-title">계정 선택</div>
+        <div class="account-picker-list">${options}</div>
+        <div class="dialog-footer">
+          <button class="dialog-btn dialog-btn-cancel">취소</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const close = (val: string | null) => { overlay.remove(); resolve(val); };
+    overlay.querySelector(".dialog-btn-cancel")!.addEventListener("click", () => close(null));
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(null); });
+    overlay.querySelectorAll<HTMLElement>(".account-picker-row").forEach((btn) => {
+      btn.addEventListener("click", () => close(btn.dataset.name!));
+    });
+    const escFn = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { close(null); document.removeEventListener("keydown", escFn); }
+    };
+    document.addEventListener("keydown", escFn);
+  });
 }
 
 // --- Shell ---
@@ -1627,12 +2018,21 @@ function renderShell() {
       const folder = sessionEl.dataset.projectFolder!;
       const path = sessionEl.dataset.projectPath!;
       const isFav = favoriteSessions.has(sid);
+      const s = allSessions.find((x) => x.session_id === sid);
+      const resolvedAcc = resolveSessionAccountName(s);
+      const accLabel = (() => {
+        const a = accountByName(resolvedAcc);
+        return a ? accountDisplay(a) : resolvedAcc;
+      })();
       showContextMenu(e.clientX, e.clientY, [
-        { label: "재개", icon: ICONS.terminal, action: () => void resumeSession(sid, path, folder, false) },
+        { label: `재개 (${accLabel})`, icon: ICONS.terminal, action: () => void resumeSession(sid, path, folder, false) },
         { label: "새 창에서 재개", icon: ICONS.newWindow, action: () => void resumeSession(sid, path, folder, true) },
         { label: "-", action: () => {} },
         { label: "Sonnet으로 재개", icon: ICONS.cpu, action: () => void resumeSession(sid, path, folder, false, "sonnet") },
         { label: "Opus로 재개", icon: ICONS.cpu, action: () => void resumeSession(sid, path, folder, false, "opus") },
+        { label: "-", action: () => {} },
+        { label: "다른 계정으로 재개...", icon: ICONS.claude, action: () => void resumeWithAccountPicker(sid, path, folder) },
+        { label: "이 세션의 계정 고정...", icon: ICONS.tag, action: () => void pinSessionAccount(sid) },
         { label: "-", action: () => {} },
         { label: isFav ? "즐겨찾기 해제" : "즐겨찾기 추가", icon: isFav ? ICONS.starOutline : ICONS.star, action: () => void toggleFavorite(sid) },
         { label: "-", action: () => {} },
@@ -1665,6 +2065,8 @@ function renderShell() {
         { label: "-", action: () => {} },
         { label: "Sonnet으로 새 세션", icon: ICONS.cpu, action: () => void startNewSessionInProject(path, folder, false, "sonnet") },
         { label: "Opus로 새 세션", icon: ICONS.cpu, action: () => void startNewSessionInProject(path, folder, false, "opus") },
+        { label: "-", action: () => {} },
+        { label: "계정 선택해서 새 세션...", icon: ICONS.claude, action: () => void startWithAccountPicker(path, folder) },
         { label: "-", action: () => {} },
         { label: "프로젝트 라벨 편집", icon: ICONS.edit, action: () => void editProjectLabel(folder, path) },
         { label: "-", action: () => {} },
@@ -1720,6 +2122,13 @@ if (!IS_TERMINAL_WINDOW) {
       const favs = await invoke<string[]>("get_favorite_sessions");
       favoriteSessions = new Set(favs);
     } catch {}
+    // Hydrate account state before first render so badges/mappings show up.
+    try { allAccounts = await invoke<Account[]>("get_accounts"); } catch {}
+    try { labelAccountMap = await invoke<Record<string, string>>("get_label_account_map"); } catch {}
+    try { sessionAccountMap = await invoke<Record<string, string>>("get_session_account_map"); } catch {}
+    try {
+      lastOauthMulti = await invoke<AccountOauthUsage[]>("get_cached_oauth_usages_per_account");
+    } catch {}
     renderShell();
     // Now that the first paint with correct theme is done, reveal the window.
     // (tauri.conf.json has visible:false so window-state can restore size without flash.)
@@ -1740,6 +2149,15 @@ if (!IS_TERMINAL_WINDOW) {
       lastOauthError = null;
       renderUsageStatus(lastUsageReport);
       renderUsagePanelIfOpen(lastUsageReport ?? undefined);
+    });
+    listen<AccountOauthUsage[]>("usage-oauth-multi-update", (event) => {
+      lastOauthMulti = event.payload || [];
+      renderUsageStatus(lastUsageReport);
+    });
+    listen<Account[]>("accounts-update", (event) => {
+      allAccounts = event.payload || [];
+      renderUsageStatus(lastUsageReport);
+      renderTree();
     });
     listen<string>("usage-oauth-error", (event) => {
       lastOauthError = event.payload;

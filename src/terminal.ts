@@ -58,6 +58,8 @@ interface AddTabPayload {
   cwd?: string | null;
   adopt?: boolean;
   initial_content?: string;
+  env?: Record<string, string>;
+  account_name?: string | null;
 }
 
 interface Pane {
@@ -66,6 +68,8 @@ interface Pane {
   title: string;
   sshArgs: string[];
   cwd: string | null;
+  env?: Record<string, string>;
+  accountName?: string | null;
   fontSize: number;
   paneEl: HTMLElement;
   headerEl: HTMLElement;
@@ -95,6 +99,8 @@ interface MergeTabPayload {
   initial_content: string;
   screen_x: number;
   screen_y: number;
+  env?: Record<string, string>;
+  account_name?: string | null;
 }
 
 interface PtyOutput { terminal_id: string; data: number[]; }
@@ -440,7 +446,7 @@ function applyFocusStyles(tab: Tab) {
 // ---------- Pane creation ----------
 // NOTE: handlers below look up the owning tab via findPane() each time, so a pane
 // can be moved between tabs and still behave correctly (focus, broadcast, zoom).
-function createPane(init: { id: string; baseTitle: string; title: string; sshArgs: string[]; cwd: string | null }): Pane {
+function createPane(init: { id: string; baseTitle: string; title: string; sshArgs: string[]; cwd: string | null; env?: Record<string, string>; accountName?: string | null }): Pane {
   const paneEl = document.createElement("div");
   paneEl.className = "term-pane";
   paneEl.dataset.paneId = init.id;
@@ -502,6 +508,8 @@ function createPane(init: { id: string; baseTitle: string; title: string; sshArg
     fontSize: FONT_DEFAULT,
     paneEl, headerEl, xtermEl,
     term, fit, serialize,
+    env: init.env,
+    accountName: init.accountName ?? null,
     exited: false,
   };
 
@@ -611,6 +619,8 @@ async function addTab(payload: AddTabPayload) {
     title: displayTitle,
     sshArgs: payload.ssh_args,
     cwd: payload.cwd ?? null,
+    env: payload.env,
+    accountName: payload.account_name ?? null,
   });
   tab.panes.push(pane);
   tab.ratios.push(1);
@@ -656,6 +666,7 @@ async function addTab(payload: AddTabPayload) {
       cwd: payload.cwd ?? null,
       rows: pane.term.rows || 24,
       cols: pane.term.cols || 80,
+      env: payload.env ?? null,
     });
     pane.term.focus();
     updateWindowTitle();
@@ -728,7 +739,7 @@ async function splitTab(tab: Tab, from: Pane, sshArgs: string[], baseTitle: stri
 
   const newId = uid();
   const displayTitle = chooseTitle(baseTitle);
-  const pane = createPane({ id: newId, baseTitle, title: displayTitle, sshArgs, cwd: from.cwd });
+  const pane = createPane({ id: newId, baseTitle, title: displayTitle, sshArgs, cwd: from.cwd, env: from.env, accountName: from.accountName });
 
   const insertIdx = tab.panes.indexOf(from) + 1;
   tab.panes.splice(insertIdx, 0, pane);
@@ -752,6 +763,7 @@ async function splitTab(tab: Tab, from: Pane, sshArgs: string[], baseTitle: stri
       cwd: from.cwd,
       rows: pane.term.rows || 24,
       cols: pane.term.cols || 80,
+      env: from.env ?? null,
     });
     pane.term.focus();
     updateWindowTitle();

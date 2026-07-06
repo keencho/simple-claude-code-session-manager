@@ -55,6 +55,8 @@ struct SessionInfo {
     project_folder: String,
     labels: Vec<String>,
     custom_title: String,
+    #[serde(default)]
+    account_name: String,
 }
 
 unsafe impl Send for SessionInfo {}
@@ -64,6 +66,9 @@ struct ProjectInfo {
     folder_name: String,
     project_path: String,
     session_count: u32,
+    // For multi-account: which accounts this project folder appears under.
+    #[serde(default)]
+    account_names: Vec<String>,
 }
 
 // --- Labels ---
@@ -137,6 +142,10 @@ struct AddTabPayload {
     adopt: bool,
     #[serde(default)]
     initial_content: String,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default)]
+    account_name: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -148,6 +157,10 @@ struct MergeTabPayload {
     initial_content: String,
     screen_x: f64,
     screen_y: f64,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default)]
+    account_name: Option<String>,
 }
 
 // --- App state ---
@@ -324,7 +337,7 @@ fn resolve_ambiguous_path(template: &str) -> String {
     parts.join("\\")
 }
 
-fn scan_project(project_dir: &Path, folder_name: &str, labels: &Labels, titles: &HashMap<String, String>) -> Vec<SessionInfo> {
+fn scan_project(project_dir: &Path, folder_name: &str, account_name: &str, labels: &Labels, titles: &HashMap<String, String>) -> Vec<SessionInfo> {
     let mut sessions = Vec::new();
     let index_path = project_dir.join("sessions-index.json");
     let index: Option<SessionsIndex> = if index_path.exists() {
@@ -343,28 +356,34 @@ fn scan_project(project_dir: &Path, folder_name: &str, labels: &Labels, titles: 
         let labels_vec = labels.labels.get(&session_id).cloned().unwrap_or_default();
         let custom_title = titles.get(&session_id).cloned().unwrap_or_default();
         if let Some(idx) = indexed.get(&session_id) {
-            sessions.push(SessionInfo { session_id, first_prompt: idx.first_prompt.clone().unwrap_or_default(), summary: idx.summary.clone().unwrap_or_default(), message_count: idx.message_count, created: idx.created.clone().unwrap_or_default(), modified: idx.modified.clone().unwrap_or_default(), git_branch: idx.git_branch.clone().unwrap_or_default(), project_path: project_path.clone(), project_folder: folder_name.to_string(), labels: labels_vec, custom_title });
+            sessions.push(SessionInfo { session_id, first_prompt: idx.first_prompt.clone().unwrap_or_default(), summary: idx.summary.clone().unwrap_or_default(), message_count: idx.message_count, created: idx.created.clone().unwrap_or_default(), modified: idx.modified.clone().unwrap_or_default(), git_branch: idx.git_branch.clone().unwrap_or_default(), project_path: project_path.clone(), project_folder: folder_name.to_string(), labels: labels_vec, custom_title, account_name: account_name.to_string() });
         } else {
             let first_prompt = extract_first_prompt_from_jsonl(&file_path).unwrap_or_default();
             let msg_count = estimate_message_count(&file_path);
             let modified = file_time_to_rfc3339(&file_path, true);
             let created = file_time_to_rfc3339(&file_path, false);
-            sessions.push(SessionInfo { session_id, first_prompt, summary: String::new(), message_count: msg_count, created, modified, git_branch: String::new(), project_path: project_path.clone(), project_folder: folder_name.to_string(), labels: labels_vec, custom_title });
+            sessions.push(SessionInfo { session_id, first_prompt, summary: String::new(), message_count: msg_count, created, modified, git_branch: String::new(), project_path: project_path.clone(), project_folder: folder_name.to_string(), labels: labels_vec, custom_title, account_name: account_name.to_string() });
         }
     }
     sessions
 }
 
 fn scan_all_sessions() -> Result<Vec<SessionInfo>, String> {
-    let projects_dir = get_claude_projects_dir().ok_or("Cannot find .claude/projects")?;
-    if !projects_dir.exists() { return Ok(Vec::new()); }
     let labels = load_labels();
     let titles = load_session_titles();
-    let project_dirs: Vec<_> = fs::read_dir(&projects_dir).map_err(|e| e.to_string())?.flatten().filter(|e| e.path().is_dir()).map(|e| e.path()).collect();
-    let mut all_sessions: Vec<SessionInfo> = project_dirs.par_iter().flat_map(|dir| {
-        let folder = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
-        scan_project(dir, &folder, &labels, &titles)
-    }).collect();
+    let mut all_sessions: Vec<SessionInfo> = Vec::new();
+    for (account_name, projects_dir) in all_projects_dirs() {
+        if !projects_dir.exists() { continue; }
+        let project_dirs: Vec<_> = match fs::read_dir(&projects_dir) {
+            Ok(r) => r.flatten().filter(|e| e.path().is_dir()).map(|e| e.path()).collect(),
+            Err(_) => continue,
+        };
+        let mut scanned: Vec<SessionInfo> = project_dirs.par_iter().flat_map(|dir| {
+            let folder = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+            scan_project(dir, &folder, &account_name, &labels, &titles)
+        }).collect();
+        all_sessions.append(&mut scanned);
+    }
     all_sessions.par_sort_unstable_by(|a, b| b.modified.cmp(&a.modified));
     Ok(all_sessions)
 }
@@ -385,16 +404,36 @@ fn get_sessions(cache: State<Mutex<AppCache>>) -> Result<Vec<SessionInfo>, Strin
 
 #[tauri::command]
 fn get_projects() -> Result<Vec<ProjectInfo>, String> {
-    let projects_dir = get_claude_projects_dir().ok_or("Cannot find .claude/projects")?;
-    if !projects_dir.exists() { return Ok(Vec::new()); }
-    let project_dirs: Vec<_> = fs::read_dir(&projects_dir).map_err(|e| e.to_string())?.flatten().filter(|e| e.path().is_dir()).map(|e| e.path()).collect();
-    let mut projects: Vec<ProjectInfo> = project_dirs.par_iter().map(|path| {
-        let folder_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let session_count = fs::read_dir(path).map(|entries| entries.flatten().filter(|e| { let p = e.path(); !p.is_dir() && p.extension().map(|ext| ext == "jsonl").unwrap_or(false) }).count() as u32).unwrap_or(0);
-        let index_path = path.join("sessions-index.json");
-        let project_path = if index_path.exists() { fs::read_to_string(&index_path).ok().and_then(|s| serde_json::from_str::<SessionsIndex>(&s).ok()).and_then(|i| i.original_path).unwrap_or_else(|| decode_folder_to_path(&folder_name)) } else { decode_folder_to_path(&folder_name) };
-        ProjectInfo { folder_name, project_path, session_count }
-    }).collect();
+    // Aggregate across all account dirs. If two accounts have the same project
+    // folder, we merge them: one ProjectInfo with summed session_count and
+    // both account names listed.
+    let mut by_folder: HashMap<String, ProjectInfo> = HashMap::new();
+    for (account_name, projects_dir) in all_projects_dirs() {
+        if !projects_dir.exists() { continue; }
+        let project_dirs: Vec<_> = match fs::read_dir(&projects_dir) {
+            Ok(r) => r.flatten().filter(|e| e.path().is_dir()).map(|e| e.path()).collect(),
+            Err(_) => continue,
+        };
+        let scanned: Vec<ProjectInfo> = project_dirs.par_iter().map(|path| {
+            let folder_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let session_count = fs::read_dir(path).map(|entries| entries.flatten().filter(|e| { let p = e.path(); !p.is_dir() && p.extension().map(|ext| ext == "jsonl").unwrap_or(false) }).count() as u32).unwrap_or(0);
+            let index_path = path.join("sessions-index.json");
+            let project_path = if index_path.exists() { fs::read_to_string(&index_path).ok().and_then(|s| serde_json::from_str::<SessionsIndex>(&s).ok()).and_then(|i| i.original_path).unwrap_or_else(|| decode_folder_to_path(&folder_name)) } else { decode_folder_to_path(&folder_name) };
+            ProjectInfo { folder_name, project_path, session_count, account_names: vec![account_name.clone()] }
+        }).collect();
+        for p in scanned {
+            by_folder
+                .entry(p.folder_name.clone())
+                .and_modify(|existing| {
+                    existing.session_count += p.session_count;
+                    if !existing.account_names.contains(&account_name) {
+                        existing.account_names.push(account_name.clone());
+                    }
+                })
+                .or_insert(p);
+        }
+    }
+    let mut projects: Vec<ProjectInfo> = by_folder.into_values().collect();
     projects.sort_by(|a, b| a.project_path.cmp(&b.project_path));
     Ok(projects)
 }
@@ -424,9 +463,16 @@ fn set_labels(session_id: String, labels: Vec<String>) -> Result<(), String> {
     save_labels(&all_labels)
 }
 
+fn projects_dir_for_account_name(name: &str) -> Option<PathBuf> {
+    load_accounts().iter().find(|a| a.name == name).and_then(account_projects_dir)
+}
+
 #[tauri::command]
-fn delete_session(session_id: String, project_folder: String) -> Result<(), String> {
-    let projects_dir = get_claude_projects_dir().ok_or("Cannot find .claude/projects")?;
+fn delete_session(session_id: String, project_folder: String, account_name: Option<String>) -> Result<(), String> {
+    let projects_dir = match account_name.as_deref() {
+        Some(n) => projects_dir_for_account_name(n).ok_or("계정 dir 없음")?,
+        None => get_claude_projects_dir().ok_or("Cannot find .claude/projects")?,
+    };
     let project_dir = projects_dir.join(&project_folder);
     let jsonl_path = project_dir.join(format!("{}.jsonl", session_id));
     if jsonl_path.exists() { fs::remove_file(&jsonl_path).map_err(|e| e.to_string())?; }
@@ -445,34 +491,47 @@ fn delete_session(session_id: String, project_folder: String) -> Result<(), Stri
     }
     let mut labels = load_labels(); labels.labels.remove(&session_id); let _ = save_labels(&labels);
     let mut titles = load_session_titles(); titles.remove(&session_id); let _ = save_session_titles(&titles);
+    let mut smap = load_session_account_map(); smap.remove(&session_id); let _ = save_session_account_map(&smap);
     cleanup_empty_project(&project_dir);
     Ok(())
 }
 
 #[tauri::command]
-fn delete_project_sessions(project_folder: String) -> Result<u32, String> {
-    let projects_dir = get_claude_projects_dir().ok_or("Cannot find .claude/projects")?;
-    let project_dir = projects_dir.join(&project_folder);
-    if !project_dir.exists() { return Ok(0); }
+fn delete_project_sessions(project_folder: String, account_name: Option<String>) -> Result<u32, String> {
+    // If account_name given, only that one. Otherwise wipe the project folder
+    // across every account (the "nuke this project" semantic).
+    let target_dirs: Vec<PathBuf> = match account_name.as_deref() {
+        Some(n) => projects_dir_for_account_name(n).into_iter().map(|d| d.join(&project_folder)).collect(),
+        None => all_projects_dirs().into_iter().map(|(_, d)| d.join(&project_folder)).collect(),
+    };
     let mut deleted = 0u32;
     let mut labels = load_labels();
     let mut titles = load_session_titles();
-    let entries: Vec<_> = fs::read_dir(&project_dir).map_err(|e| e.to_string())?.flatten().collect();
-    for entry in &entries {
-        let path = entry.path();
-        let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-        if name.ends_with(".jsonl") {
-            let sid = name.trim_end_matches(".jsonl");
-            labels.labels.remove(sid); titles.remove(sid);
-            let data_dir = project_dir.join(sid);
-            if data_dir.is_dir() { let _ = fs::remove_dir_all(&data_dir); }
-            let _ = fs::remove_file(&path);
-            deleted += 1;
+    let mut smap = load_session_account_map();
+    for project_dir in target_dirs {
+        if !project_dir.exists() { continue; }
+        let entries: Vec<_> = match fs::read_dir(&project_dir) {
+            Ok(r) => r.flatten().collect(),
+            Err(_) => continue,
+        };
+        for entry in &entries {
+            let path = entry.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            if name.ends_with(".jsonl") {
+                let sid = name.trim_end_matches(".jsonl");
+                labels.labels.remove(sid); titles.remove(sid); smap.remove(sid);
+                let data_dir = project_dir.join(sid);
+                if data_dir.is_dir() { let _ = fs::remove_dir_all(&data_dir); }
+                let _ = fs::remove_file(&path);
+                deleted += 1;
+            }
         }
+        let _ = fs::remove_file(project_dir.join("sessions-index.json"));
+        cleanup_empty_project(&project_dir);
     }
-    let _ = save_labels(&labels); let _ = save_session_titles(&titles);
-    let _ = fs::remove_file(project_dir.join("sessions-index.json"));
-    cleanup_empty_project(&project_dir);
+    let _ = save_labels(&labels);
+    let _ = save_session_titles(&titles);
+    let _ = save_session_account_map(&smap);
     Ok(deleted)
 }
 
@@ -486,13 +545,14 @@ async fn open_session(
     title: String,
     new_window: bool,
     model: Option<String>,
+    account: Option<String>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let mut args: Vec<String> = Vec::new();
-    if let Some(sid) = session_id {
+    if let Some(sid) = &session_id {
         args.push("--resume".to_string());
-        args.push(sid);
+        args.push(sid.clone());
     }
     if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
         args.push("--model".to_string());
@@ -501,6 +561,26 @@ async fn open_session(
     if skip_permissions {
         args.push("--dangerously-skip-permissions".to_string());
     }
+
+    // Resolve which account this session belongs to.
+    let accounts = load_accounts();
+    let account_name = match account.filter(|s| !s.trim().is_empty()) {
+        Some(a) if accounts.iter().any(|x| x.name == a) => a,
+        _ => {
+            let labels = session_id.as_deref().map(labels_for_session).unwrap_or_default();
+            resolve_account_name(session_id.as_deref(), &labels, &accounts)
+        }
+    };
+    let acc = accounts.iter().find(|a| a.name == account_name).cloned()
+        .unwrap_or_else(default_account);
+
+    let mut env = HashMap::new();
+    if let Some(dir) = account_config_dir(&acc) {
+        // Ensure the dir exists so Claude can write its session jsonl there.
+        let _ = fs::create_dir_all(&dir);
+        env.insert("CLAUDE_CONFIG_DIR".to_string(), dir.to_string_lossy().to_string());
+    }
+
     let terminal_id = Uuid::new_v4().to_string();
     let payload = AddTabPayload {
         terminal_id,
@@ -509,6 +589,8 @@ async fn open_session(
         cwd: Some(project_path),
         adopt: false,
         initial_content: String::new(),
+        env,
+        account_name: Some(account_name.clone()),
     };
     let existing_label = if new_window {
         None
@@ -549,6 +631,7 @@ fn pty_spawn(
     cwd: Option<String>,
     rows: u16,
     cols: u16,
+    env: Option<HashMap<String, String>>,
     app: AppHandle,
     state: State<AppState>,
 ) -> Result<(), String> {
@@ -568,6 +651,11 @@ fn pty_spawn(
     for a in &ssh_args { cmd.arg(a); }
     if let Some(dir) = &cwd { cmd.cwd(dir); }
     cmd.env("TERM", "xterm-256color");
+    if let Some(extra) = env {
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+    }
     let child = pair.slave.spawn_command(cmd).map_err(|e| format!("spawn failed: {}", e))?;
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().map_err(|e| format!("clone reader failed: {}", e))?;
@@ -671,7 +759,7 @@ async fn drop_tab(
         let x1 = x0 + size.width as f64;
         let y1 = y0 + size.height as f64;
         if cur_x >= x0 && cur_x < x1 && cur_y >= y0 && cur_y < y1 {
-            window.emit_to(label.as_str(), "merge-tab", MergeTabPayload { terminal_id, title, ssh_args, cwd, initial_content, screen_x, screen_y }).map_err(|e| e.to_string())?;
+            window.emit_to(label.as_str(), "merge-tab", MergeTabPayload { terminal_id, title, ssh_args, cwd, initial_content, screen_x, screen_y, env: HashMap::new(), account_name: None }).map_err(|e| e.to_string())?;
             let _ = window.set_focus();
             return Ok(true);
         }
@@ -682,7 +770,7 @@ async fn drop_tab(
     // so detaching from main is meaningful.
     if is_last_tab && source_label.starts_with("term-") { return Ok(false); }
     let label = format!("term-{}", Uuid::new_v4().simple());
-    let payload = AddTabPayload { terminal_id, title: title.clone(), ssh_args, cwd, adopt: true, initial_content };
+    let payload = AddTabPayload { terminal_id, title: title.clone(), ssh_args, cwd, adopt: true, initial_content, env: HashMap::new(), account_name: None };
     state.pending_tabs.lock().unwrap().insert(label.clone(), payload);
     WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
         .title(title)
@@ -706,7 +794,7 @@ async fn spawn_terminal(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let terminal_id = Uuid::new_v4().to_string();
-    let payload = AddTabPayload { terminal_id, title: title.clone(), ssh_args, cwd, adopt: false, initial_content: String::new() };
+    let payload = AddTabPayload { terminal_id, title: title.clone(), ssh_args, cwd, adopt: false, initial_content: String::new(), env: HashMap::new(), account_name: None };
     if new_window {
         let label = format!("term-{}", Uuid::new_v4().simple());
         state.pending_tabs.lock().unwrap().insert(label.clone(), payload);
@@ -955,7 +1043,6 @@ fn normalize_model(m: &Option<String>) -> Option<String> {
 
 fn aggregate_usage(active_session_id: Option<&str>) -> Result<UsageReport, String> {
     use chrono::{Local, TimeZone};
-    let projects = get_claude_projects_dir().ok_or("No ~/.claude/projects dir")?;
     let now = Local::now();
     let today_start = Local
         .from_local_datetime(&now.date_naive().and_hms_opt(0, 0, 0).unwrap())
@@ -969,75 +1056,74 @@ fn aggregate_usage(active_session_id: Option<&str>) -> Result<UsageReport, Strin
     let mut by_model_week: HashMap<String, UsageTotals> = HashMap::new();
     let mut active_session: Option<SessionUsage> = None;
 
-    let Ok(entries) = fs::read_dir(&projects) else { return Ok(UsageReport {
-        today, week, all_time, by_model_today, by_model_week, active_session,
-    }) };
+    for (_account, projects) in all_projects_dirs() {
+        let Ok(entries) = fs::read_dir(&projects) else { continue };
+        for proj in entries.flatten() {
+            let proj_path = proj.path();
+            if !proj_path.is_dir() { continue; }
+            let Ok(files) = fs::read_dir(&proj_path) else { continue };
+            for f in files.flatten() {
+                let fp = f.path();
+                if !fp.is_file() { continue; }
+                if fp.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
 
-    for proj in entries.flatten() {
-        let proj_path = proj.path();
-        if !proj_path.is_dir() { continue; }
-        let Ok(files) = fs::read_dir(&proj_path) else { continue };
-        for f in files.flatten() {
-            let fp = f.path();
-            if !fp.is_file() { continue; }
-            if fp.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+                let session_id = fp.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let Ok(content) = fs::read_to_string(&fp) else { continue };
 
-            let session_id = fp.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            let Ok(content) = fs::read_to_string(&fp) else { continue };
+                let mut s_totals = UsageTotals::default();
+                let mut s_first: Option<chrono::DateTime<Local>> = None;
+                let mut s_last: Option<chrono::DateTime<Local>> = None;
+                let mut s_model: Option<String> = None;
 
-            let mut s_totals = UsageTotals::default();
-            let mut s_first: Option<chrono::DateTime<Local>> = None;
-            let mut s_last: Option<chrono::DateTime<Local>> = None;
-            let mut s_model: Option<String> = None;
+                for line in content.lines() {
+                    if line.trim().is_empty() { continue; }
+                    let Ok(entry) = serde_json::from_str::<JsonlEntry>(line) else { continue };
+                    let Some(msg) = entry.message else { continue };
+                    let Some(usage) = msg.usage else { continue };
+                    let model = normalize_model(&msg.model);
+                    let ts = entry.timestamp.as_deref()
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|d| d.with_timezone(&Local));
 
-            for line in content.lines() {
-                if line.trim().is_empty() { continue; }
-                let Ok(entry) = serde_json::from_str::<JsonlEntry>(line) else { continue };
-                let Some(msg) = entry.message else { continue };
-                let Some(usage) = msg.usage else { continue };
-                let model = normalize_model(&msg.model);
-                let ts = entry.timestamp.as_deref()
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                    .map(|d| d.with_timezone(&Local));
+                    all_time.add(&usage);
+                    s_totals.add(&usage);
+                    if s_first.is_none() { s_first = ts; }
+                    if ts.is_some() { s_last = ts; }
+                    if model.is_some() { s_model = model.clone(); }
 
-                all_time.add(&usage);
-                s_totals.add(&usage);
-                if s_first.is_none() { s_first = ts; }
-                if ts.is_some() { s_last = ts; }
-                if model.is_some() { s_model = model.clone(); }
-
-                if let Some(t) = ts {
-                    if t >= week_start {
-                        week.add(&usage);
-                        if let Some(m) = &model {
-                            by_model_week.entry(m.clone()).or_default().add(&usage);
+                    if let Some(t) = ts {
+                        if t >= week_start {
+                            week.add(&usage);
+                            if let Some(m) = &model {
+                                by_model_week.entry(m.clone()).or_default().add(&usage);
+                            }
                         }
-                    }
-                    if t >= today_start {
-                        today.add(&usage);
-                        if let Some(m) = &model {
-                            by_model_today.entry(m.clone()).or_default().add(&usage);
+                        if t >= today_start {
+                            today.add(&usage);
+                            if let Some(m) = &model {
+                                by_model_today.entry(m.clone()).or_default().add(&usage);
+                            }
                         }
                     }
                 }
-            }
 
-            if Some(session_id.as_str()) == active_session_id {
-                let duration_min = match (s_first, s_last) {
-                    (Some(a), Some(b)) => (b - a).num_minutes().max(0) as u32,
-                    _ => 0,
-                };
-                active_session = Some(SessionUsage {
-                    session_id: session_id.clone(),
-                    model: s_model,
-                    totals: s_totals,
-                    duration_min,
-                    first_ts: s_first.map(|t| t.to_rfc3339()),
-                    last_ts: s_last.map(|t| t.to_rfc3339()),
-                });
+                if Some(session_id.as_str()) == active_session_id {
+                    let duration_min = match (s_first, s_last) {
+                        (Some(a), Some(b)) => (b - a).num_minutes().max(0) as u32,
+                        _ => 0,
+                    };
+                    active_session = Some(SessionUsage {
+                        session_id: session_id.clone(),
+                        model: s_model,
+                        totals: s_totals,
+                        duration_min,
+                        first_ts: s_first.map(|t| t.to_rfc3339()),
+                        last_ts: s_last.map(|t| t.to_rfc3339()),
+                    });
+                }
             }
         }
     }
@@ -1049,6 +1135,7 @@ fn aggregate_usage(active_session_id: Option<&str>) -> Result<UsageReport, Strin
 struct UsageState {
     last_signature: Mutex<Option<u64>>, // today_total
     cached_oauth: Mutex<Option<OauthUsage>>,
+    cached_oauth_multi: Mutex<HashMap<String, OauthUsage>>,
 }
 
 #[tauri::command]
@@ -1064,6 +1151,29 @@ fn get_cached_oauth_usage(usage_state: State<'_, Arc<UsageState>>) -> Result<Oau
         .ok_or_else(|| "캐시 없음".into())
 }
 
+#[tauri::command]
+fn get_cached_oauth_usages_per_account(usage_state: State<'_, Arc<UsageState>>) -> Result<Vec<AccountOauthUsage>, String> {
+    let cache = usage_state.cached_oauth_multi.lock()
+        .map_err(|_| "lock 실패".to_string())?
+        .clone();
+    let accounts = load_accounts();
+    let mut out = Vec::with_capacity(accounts.len());
+    for acc in accounts {
+        let usage = cache.get(&acc.name).cloned();
+        out.push(AccountOauthUsage {
+            account_name: acc.name,
+            alias: acc.alias,
+            email: acc.email,
+            subscription: acc.subscription,
+            org_name: acc.org_name,
+            logged_in: acc.logged_in,
+            usage,
+            error: None,
+        });
+    }
+    Ok(out)
+}
+
 // Per-window session usage. Each window passes its own active pane's session_id.
 // Walks ~/.claude/projects/** to find the matching session file and returns its
 // totals. Much faster than full aggregate_usage because it only parses one file.
@@ -1074,23 +1184,24 @@ fn get_cached_oauth_usage(usage_state: State<'_, Arc<UsageState>>) -> Result<Oau
 // knows which timestamp to pass. Returns None until a new file appears.
 #[tauri::command]
 fn find_new_session_since(since_ms: i64) -> Result<Option<String>, String> {
-    let Some(projects) = get_claude_projects_dir() else { return Ok(None) };
-    let Ok(entries) = fs::read_dir(&projects) else { return Ok(None) };
     let threshold = std::time::UNIX_EPOCH + std::time::Duration::from_millis(since_ms.max(0) as u64);
     let mut best: Option<(std::time::SystemTime, String)> = None;
-    for proj in entries.flatten() {
-        let pp = proj.path();
-        if !pp.is_dir() { continue; }
-        let Ok(files) = fs::read_dir(&pp) else { continue };
-        for f in files.flatten() {
-            let fp = f.path();
-            if fp.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
-            let Ok(meta) = fs::metadata(&fp) else { continue };
-            let Ok(mtime) = meta.modified() else { continue };
-            if mtime < threshold { continue; }
-            let Some(sid) = fp.file_stem().and_then(|s| s.to_str()).map(String::from) else { continue };
-            if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
-                best = Some((mtime, sid));
+    for (_account, projects) in all_projects_dirs() {
+        let Ok(entries) = fs::read_dir(&projects) else { continue };
+        for proj in entries.flatten() {
+            let pp = proj.path();
+            if !pp.is_dir() { continue; }
+            let Ok(files) = fs::read_dir(&pp) else { continue };
+            for f in files.flatten() {
+                let fp = f.path();
+                if fp.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+                let Ok(meta) = fs::metadata(&fp) else { continue };
+                let Ok(mtime) = meta.modified() else { continue };
+                if mtime < threshold { continue; }
+                let Some(sid) = fp.file_stem().and_then(|s| s.to_str()).map(String::from) else { continue };
+                if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+                    best = Some((mtime, sid));
+                }
             }
         }
     }
@@ -1100,8 +1211,8 @@ fn find_new_session_since(since_ms: i64) -> Result<Option<String>, String> {
 #[tauri::command]
 fn get_session_usage(session_id: String) -> Result<Option<SessionUsage>, String> {
     use chrono::Local;
-    let projects = get_claude_projects_dir().ok_or("No ~/.claude/projects dir")?;
-    let Ok(proj_entries) = fs::read_dir(&projects) else { return Ok(None) };
+    for (_account, projects) in all_projects_dirs() {
+    let Ok(proj_entries) = fs::read_dir(&projects) else { continue };
     for proj in proj_entries.flatten() {
         let p = proj.path();
         if !p.is_dir() { continue; }
@@ -1142,6 +1253,7 @@ fn get_session_usage(session_id: String) -> Result<Option<SessionUsage>, String>
             last_ts: last.map(|t| t.to_rfc3339()),
         }));
     }
+    }
     Ok(None)
 }
 
@@ -1152,24 +1264,28 @@ fn get_session_usage(session_id: String) -> Result<Option<SessionUsage>, String>
 // -----------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct OauthQuota {
-    utilization: f64,
+pub struct OauthQuota {
+    pub utilization: f64,
     #[serde(alias = "resetsAt")]
-    resets_at: Option<String>,
+    pub resets_at: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct OauthUsage {
+pub struct OauthUsage {
     #[serde(alias = "five_hour")]
-    five_hour: OauthQuota,
+    pub five_hour: OauthQuota,
     #[serde(alias = "seven_day")]
-    seven_day: OauthQuota,
+    pub seven_day: OauthQuota,
     #[serde(alias = "seven_day_sonnet")]
-    seven_day_sonnet: OauthQuota,
+    pub seven_day_sonnet: OauthQuota,
 }
 
 fn oauth_cache_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("oauth-usage-cache.json"))
+}
+
+fn oauth_cache_multi_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude").join("oauth-usage-cache-multi.json"))
 }
 
 fn load_oauth_cache_from_disk() -> Option<OauthUsage> {
@@ -1186,9 +1302,23 @@ fn save_oauth_cache_to_disk(data: &OauthUsage) {
     }
 }
 
-fn read_oauth_token() -> Result<String, String> {
-    let home = dirs::home_dir().ok_or("home 디렉토리 못 찾음")?;
-    let p = home.join(".claude").join(".credentials.json");
+fn load_oauth_cache_multi_from_disk() -> HashMap<String, OauthUsage> {
+    let Some(p) = oauth_cache_multi_path() else { return HashMap::new(); };
+    fs::read_to_string(&p).ok()
+        .and_then(|s| serde_json::from_str::<HashMap<String, OauthUsage>>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_oauth_cache_multi_to_disk(data: &HashMap<String, OauthUsage>) {
+    let Some(p) = oauth_cache_multi_path() else { return };
+    if let Some(parent) = p.parent() { let _ = fs::create_dir_all(parent); }
+    if let Ok(json) = serde_json::to_string(data) {
+        let _ = fs::write(&p, json);
+    }
+}
+
+fn read_oauth_token_for_root(claude_root: &Path) -> Result<String, String> {
+    let p = claude_root.join(".credentials.json");
     if !p.exists() {
         return Err(format!("{} 없음 — Claude Code 로그인 필요", p.display()));
     }
@@ -1201,9 +1331,9 @@ fn read_oauth_token() -> Result<String, String> {
         .ok_or("accessToken 필드 없음 — credentials.json 구조 변경 가능".into())
 }
 
-#[tauri::command]
-async fn get_oauth_usage() -> Result<OauthUsage, String> {
-    let token = read_oauth_token()?;
+async fn fetch_oauth_usage_for_account(account: &Account) -> Result<OauthUsage, String> {
+    let root = account_claude_root(account).ok_or("home 못 찾음")?;
+    let token = read_oauth_token_for_root(&root)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(6))
         .build()
@@ -1222,6 +1352,47 @@ async fn get_oauth_usage() -> Result<OauthUsage, String> {
         return Err(format!("API {}: {}", status, body));
     }
     resp.json::<OauthUsage>().await.map_err(|e| format!("JSON 파싱 실패: {}", e))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountOauthUsage {
+    pub account_name: String,
+    pub alias: Option<String>,
+    pub email: Option<String>,
+    pub subscription: Option<String>,
+    pub org_name: Option<String>,
+    pub logged_in: bool,
+    pub usage: Option<OauthUsage>,
+    pub error: Option<String>,
+}
+
+#[tauri::command]
+async fn get_oauth_usage() -> Result<OauthUsage, String> {
+    let acc = load_accounts().into_iter().next().unwrap_or_else(default_account);
+    fetch_oauth_usage_for_account(&acc).await
+}
+
+#[tauri::command]
+async fn get_oauth_usages_per_account() -> Result<Vec<AccountOauthUsage>, String> {
+    let accounts = load_accounts();
+    let mut out: Vec<AccountOauthUsage> = Vec::with_capacity(accounts.len());
+    for acc in accounts {
+        let (usage, error) = match fetch_oauth_usage_for_account(&acc).await {
+            Ok(u) => (Some(u), None),
+            Err(e) => (None, Some(e)),
+        };
+        out.push(AccountOauthUsage {
+            account_name: acc.name,
+            alias: acc.alias,
+            email: acc.email,
+            subscription: acc.subscription,
+            org_name: acc.org_name,
+            logged_in: acc.logged_in,
+            usage,
+            error,
+        });
+    }
+    Ok(out)
 }
 
 // =========================================================================
@@ -1256,6 +1427,376 @@ fn set_session_favorite(session_id: String, favorite: bool) -> Result<Vec<String
     Ok(list)
 }
 
+// =========================================================================
+// Accounts — multi-account support via CLAUDE_CONFIG_DIR
+// =========================================================================
+
+pub const DEFAULT_ACCOUNT_NAME: &str = "default";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Account {
+    pub name: String,
+    // None = use ~/.claude (the default account)
+    #[serde(default)]
+    pub config_dir: Option<String>,
+    #[serde(default)]
+    pub alias: Option<String>,
+    // Cached metadata, refreshed via `claude auth status`
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub subscription: Option<String>,
+    #[serde(default)]
+    pub org_name: Option<String>,
+    #[serde(default)]
+    pub logged_in: bool,
+}
+
+fn accounts_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("home")?;
+    Ok(home.join(".claude").join("accounts.json"))
+}
+
+fn default_account() -> Account {
+    Account {
+        name: DEFAULT_ACCOUNT_NAME.to_string(),
+        config_dir: None,
+        alias: None,
+        email: None,
+        subscription: None,
+        org_name: None,
+        logged_in: false,
+    }
+}
+
+fn load_accounts() -> Vec<Account> {
+    let Ok(p) = accounts_path() else { return vec![default_account()]; };
+    if !p.exists() { return vec![default_account()]; }
+    let mut list: Vec<Account> = fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| vec![default_account()]);
+    if !list.iter().any(|a| a.name == DEFAULT_ACCOUNT_NAME) {
+        list.insert(0, default_account());
+    }
+    list
+}
+
+fn save_accounts(list: &[Account]) -> Result<(), String> {
+    let p = accounts_path()?;
+    if let Some(parent) = p.parent() { let _ = fs::create_dir_all(parent); }
+    let json = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
+    fs::write(&p, json).map_err(|e| e.to_string())
+}
+
+// Resolve the config_dir for an account name. The default account has no
+// config_dir (uses ~/.claude). Other accounts default to ~/.claude-accounts/{name}
+// if their stored config_dir is empty.
+fn account_config_dir(account: &Account) -> Option<PathBuf> {
+    if account.name == DEFAULT_ACCOUNT_NAME { return None; }
+    if let Some(s) = account.config_dir.as_ref().filter(|s| !s.trim().is_empty()) {
+        return Some(PathBuf::from(s));
+    }
+    dirs::home_dir().map(|h| h.join(".claude-accounts").join(&account.name))
+}
+
+// Returns the .claude dir (or its override) for an account. Used to compute
+// the projects/, .credentials.json, etc. paths.
+fn account_claude_root(account: &Account) -> Option<PathBuf> {
+    match account_config_dir(account) {
+        Some(dir) => Some(dir),
+        None => dirs::home_dir().map(|h| h.join(".claude")),
+    }
+}
+
+fn account_projects_dir(account: &Account) -> Option<PathBuf> {
+    account_claude_root(account).map(|r| r.join("projects"))
+}
+
+// All accounts + their projects dirs, in priority order (default first).
+fn all_projects_dirs() -> Vec<(String, PathBuf)> {
+    load_accounts()
+        .into_iter()
+        .filter_map(|a| account_projects_dir(&a).map(|p| (a.name.clone(), p)))
+        .collect()
+}
+
+#[tauri::command]
+fn get_accounts() -> Result<Vec<Account>, String> {
+    Ok(load_accounts())
+}
+
+#[tauri::command]
+fn add_account(name: String, alias: Option<String>, config_dir: Option<String>) -> Result<Vec<Account>, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() { return Err("계정 이름이 비어있음".into()); }
+    if name == DEFAULT_ACCOUNT_NAME { return Err("기본 계정 이름은 예약됨".into()); }
+    let mut list = load_accounts();
+    if list.iter().any(|a| a.name == name) {
+        return Err(format!("이미 존재하는 계정: {}", name));
+    }
+    let new = Account {
+        name: name.clone(),
+        config_dir: config_dir.filter(|s| !s.trim().is_empty()),
+        alias: alias.filter(|s| !s.trim().is_empty()),
+        email: None,
+        subscription: None,
+        org_name: None,
+        logged_in: false,
+    };
+    // Create the config dir on disk so the user can `claude /login` into it.
+    if let Some(dir) = account_config_dir(&new) {
+        let _ = fs::create_dir_all(&dir);
+    }
+    list.push(new);
+    save_accounts(&list)?;
+    Ok(list)
+}
+
+#[tauri::command]
+fn remove_account(name: String) -> Result<Vec<Account>, String> {
+    if name == DEFAULT_ACCOUNT_NAME { return Err("기본 계정은 삭제 불가".into()); }
+    let mut list = load_accounts();
+    list.retain(|a| a.name != name);
+    save_accounts(&list)?;
+    // Also strip mapping entries referring to this account.
+    let mut lmap = load_label_account_map();
+    lmap.retain(|_, v| v != &name);
+    let _ = save_label_account_map(&lmap);
+    let mut smap = load_session_account_map();
+    smap.retain(|_, v| v != &name);
+    let _ = save_session_account_map(&smap);
+    Ok(list)
+}
+
+#[tauri::command]
+fn set_account_alias(name: String, alias: Option<String>) -> Result<Vec<Account>, String> {
+    let mut list = load_accounts();
+    let Some(acc) = list.iter_mut().find(|a| a.name == name) else {
+        return Err(format!("계정 없음: {}", name));
+    };
+    acc.alias = alias.filter(|s| !s.trim().is_empty());
+    save_accounts(&list)?;
+    Ok(list)
+}
+
+// --- Label / session → account mapping ---
+
+fn label_account_map_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("home")?;
+    Ok(home.join(".claude").join("label-account-map.json"))
+}
+fn session_account_map_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("home")?;
+    Ok(home.join(".claude").join("session-account-map.json"))
+}
+
+fn load_label_account_map() -> HashMap<String, String> {
+    label_account_map_path().ok()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+fn save_label_account_map(m: &HashMap<String, String>) -> Result<(), String> {
+    let p = label_account_map_path()?;
+    if let Some(parent) = p.parent() { let _ = fs::create_dir_all(parent); }
+    let json = serde_json::to_string_pretty(m).map_err(|e| e.to_string())?;
+    fs::write(p, json).map_err(|e| e.to_string())
+}
+
+fn load_session_account_map() -> HashMap<String, String> {
+    session_account_map_path().ok()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+fn save_session_account_map(m: &HashMap<String, String>) -> Result<(), String> {
+    let p = session_account_map_path()?;
+    if let Some(parent) = p.parent() { let _ = fs::create_dir_all(parent); }
+    let json = serde_json::to_string_pretty(m).map_err(|e| e.to_string())?;
+    fs::write(p, json).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_label_account_map() -> HashMap<String, String> { load_label_account_map() }
+
+#[tauri::command]
+fn set_label_account_mapping(label: String, account: Option<String>) -> Result<HashMap<String, String>, String> {
+    let mut m = load_label_account_map();
+    match account.filter(|s| !s.trim().is_empty()) {
+        Some(a) => { m.insert(label, a); }
+        None => { m.remove(&label); }
+    }
+    save_label_account_map(&m)?;
+    Ok(m)
+}
+
+#[tauri::command]
+fn get_session_account_map() -> HashMap<String, String> { load_session_account_map() }
+
+#[tauri::command]
+fn set_session_account_mapping(session_id: String, account: Option<String>) -> Result<HashMap<String, String>, String> {
+    let mut m = load_session_account_map();
+    match account.filter(|s| !s.trim().is_empty()) {
+        Some(a) => { m.insert(session_id, a); }
+        None => { m.remove(&session_id); }
+    }
+    save_session_account_map(&m)?;
+    Ok(m)
+}
+
+// Priority: explicit session→account > any label→account match > default.
+// Returns the account name. Falls back to default if the resolved name isn't
+// in the registered account list.
+fn resolve_account_name(
+    session_id: Option<&str>,
+    labels: &[String],
+    accounts: &[Account],
+) -> String {
+    let known: std::collections::HashSet<&str> =
+        accounts.iter().map(|a| a.name.as_str()).collect();
+    if let Some(sid) = session_id {
+        if let Some(name) = load_session_account_map().get(sid) {
+            if known.contains(name.as_str()) { return name.clone(); }
+        }
+    }
+    let lmap = load_label_account_map();
+    for l in labels {
+        if let Some(name) = lmap.get(l) {
+            if known.contains(name.as_str()) { return name.clone(); }
+        }
+    }
+    DEFAULT_ACCOUNT_NAME.to_string()
+}
+
+// Look up a session_id's labels by scanning the labels file. Cheap (HashMap).
+fn labels_for_session(session_id: &str) -> Vec<String> {
+    load_labels().labels.get(session_id).cloned().unwrap_or_default()
+}
+
+// --- `claude auth status` integration ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountAuthInfo {
+    pub logged_in: bool,
+    pub email: Option<String>,
+    pub subscription: Option<String>,
+    pub org_name: Option<String>,
+}
+
+fn run_claude_auth_status(config_dir: Option<&Path>) -> Result<AccountAuthInfo, String> {
+    let mut cmd = if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd.exe");
+        c.arg("/c").arg("claude").arg("auth").arg("status");
+        c
+    } else {
+        let mut c = std::process::Command::new("claude");
+        c.arg("auth").arg("status");
+        c
+    };
+    if let Some(dir) = config_dir {
+        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let output = cmd.output().map_err(|e| format!("claude auth status 실행 실패: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Output looks like: "Not logged in · Please run /login" when no credentials.
+    let v: serde_json::Value = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(_) => {
+            return Ok(AccountAuthInfo {
+                logged_in: false,
+                email: None,
+                subscription: None,
+                org_name: None,
+            });
+        }
+    };
+    Ok(AccountAuthInfo {
+        logged_in: v.get("loggedIn").and_then(|x| x.as_bool()).unwrap_or(false),
+        email: v.get("email").and_then(|x| x.as_str()).map(String::from),
+        subscription: v.get("subscriptionType").and_then(|x| x.as_str()).map(String::from),
+        org_name: v.get("orgName").and_then(|x| x.as_str()).map(String::from),
+    })
+}
+
+#[tauri::command]
+fn refresh_account_info(name: String) -> Result<Vec<Account>, String> {
+    let mut list = load_accounts();
+    let dir_opt = list.iter().find(|a| a.name == name).and_then(|a| account_config_dir(a));
+    let info = run_claude_auth_status(dir_opt.as_deref())?;
+    if let Some(acc) = list.iter_mut().find(|a| a.name == name) {
+        acc.logged_in = info.logged_in;
+        acc.email = info.email;
+        acc.subscription = info.subscription;
+        acc.org_name = info.org_name;
+    }
+    save_accounts(&list)?;
+    Ok(list)
+}
+
+#[tauri::command]
+fn refresh_all_accounts() -> Result<Vec<Account>, String> {
+    let mut list = load_accounts();
+    for acc in list.iter_mut() {
+        let dir = account_config_dir(acc);
+        if let Ok(info) = run_claude_auth_status(dir.as_deref()) {
+            acc.logged_in = info.logged_in;
+            acc.email = info.email;
+            acc.subscription = info.subscription;
+            acc.org_name = info.org_name;
+        }
+    }
+    save_accounts(&list)?;
+    Ok(list)
+}
+
+// Quick command: spawn an interactive Claude session in a brand-new window
+// scoped to a specific account's CLAUDE_CONFIG_DIR. User can then run /login.
+#[tauri::command]
+async fn open_login_session_for_account(
+    account_name: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let accounts = load_accounts();
+    let acc = accounts.iter().find(|a| a.name == account_name)
+        .ok_or_else(|| format!("계정 없음: {}", account_name))?;
+    let dir = account_config_dir(acc);
+    if let Some(d) = dir.as_ref() { let _ = fs::create_dir_all(d); }
+
+    let mut env = HashMap::new();
+    if let Some(d) = dir.as_ref() {
+        env.insert("CLAUDE_CONFIG_DIR".to_string(), d.to_string_lossy().to_string());
+    }
+
+    let terminal_id = Uuid::new_v4().to_string();
+    let payload = AddTabPayload {
+        terminal_id,
+        title: format!("로그인: {}", account_name),
+        ssh_args: vec![],
+        cwd: None,
+        adopt: false,
+        initial_content: String::new(),
+        env,
+        account_name: Some(account_name.clone()),
+    };
+
+    let label = format!("term-{}", Uuid::new_v4().simple());
+    state.pending_tabs.lock().unwrap().insert(label.clone(), payload);
+    WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
+        .title(format!("Claude 로그인 — {}", account_name))
+        .inner_size(900.0, 600.0)
+        .min_inner_size(640.0, 400.0)
+        .resizable(true)
+        .disable_drag_drop_handler()
+        .build().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn main() {
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("Failed to create tokio runtime");
 
@@ -1263,6 +1804,10 @@ fn main() {
     // Hydrate oauth cache from disk so windows opened before first poll still see data.
     if let Some(disk) = load_oauth_cache_from_disk() {
         if let Ok(mut c) = usage_state.cached_oauth.lock() { *c = Some(disk); }
+    }
+    let disk_multi = load_oauth_cache_multi_from_disk();
+    if !disk_multi.is_empty() {
+        if let Ok(mut c) = usage_state.cached_oauth_multi.lock() { *c = disk_multi; }
     }
 
     tauri::Builder::default()
@@ -1294,20 +1839,68 @@ fn main() {
                         }
                     }
                 });
-                // 90s polling for OAuth rate-limit endpoint. /usage data doesn't
-                // change sub-second and this endpoint is undocumented, so be gentle.
+                // 90s polling for OAuth rate-limit endpoint, per account.
+                // /usage data doesn't change sub-second and this endpoint is
+                // undocumented, so be gentle.
                 let handle2 = app.handle().clone();
                 let oauth_state = usage_state.clone();
                 tauri::async_runtime::spawn(async move {
                     loop {
-                        match get_oauth_usage().await {
-                            Ok(data) => {
-                                if let Ok(mut c) = oauth_state.cached_oauth.lock() { *c = Some(data.clone()); }
-                                save_oauth_cache_to_disk(&data);
-                                let _ = handle2.emit("usage-oauth-update", &data);
+                        // Refresh `claude auth status` for each account (cheap
+                        // subprocess) so emails/subscriptions stay current if
+                        // the user logs in/out via the embedded terminal.
+                        if let Ok(refreshed) = (|| -> Result<Vec<Account>, String> {
+                            let mut list = load_accounts();
+                            for acc in list.iter_mut() {
+                                let dir = account_config_dir(acc);
+                                if let Ok(info) = run_claude_auth_status(dir.as_deref()) {
+                                    acc.logged_in = info.logged_in;
+                                    acc.email = info.email;
+                                    acc.subscription = info.subscription;
+                                    acc.org_name = info.org_name;
+                                }
                             }
-                            Err(e) => { let _ = handle2.emit("usage-oauth-error", &e); }
+                            save_accounts(&list)?;
+                            Ok(list)
+                        })() {
+                            let _ = handle2.emit("accounts-update", &refreshed);
                         }
+
+                        let accounts = load_accounts();
+                        let mut per_account: Vec<AccountOauthUsage> = Vec::with_capacity(accounts.len());
+                        let mut cache_map: HashMap<String, OauthUsage> = HashMap::new();
+                        let mut default_for_legacy: Option<OauthUsage> = None;
+                        for acc in &accounts {
+                            let result = fetch_oauth_usage_for_account(acc).await;
+                            let (usage, error) = match result {
+                                Ok(u) => {
+                                    cache_map.insert(acc.name.clone(), u.clone());
+                                    if acc.name == DEFAULT_ACCOUNT_NAME {
+                                        default_for_legacy = Some(u.clone());
+                                    }
+                                    (Some(u), None)
+                                }
+                                Err(e) => (None, Some(e)),
+                            };
+                            per_account.push(AccountOauthUsage {
+                                account_name: acc.name.clone(),
+                                alias: acc.alias.clone(),
+                                email: acc.email.clone(),
+                                subscription: acc.subscription.clone(),
+                                org_name: acc.org_name.clone(),
+                                logged_in: acc.logged_in,
+                                usage,
+                                error,
+                            });
+                        }
+                        if let Ok(mut c) = oauth_state.cached_oauth_multi.lock() { *c = cache_map.clone(); }
+                        save_oauth_cache_multi_to_disk(&cache_map);
+                        if let Some(d) = default_for_legacy {
+                            if let Ok(mut c) = oauth_state.cached_oauth.lock() { *c = Some(d.clone()); }
+                            save_oauth_cache_to_disk(&d);
+                            let _ = handle2.emit("usage-oauth-update", &d);
+                        }
+                        let _ = handle2.emit("usage-oauth-multi-update", &per_account);
                         tokio::time::sleep(Duration::from_secs(90)).await;
                     }
                 });
@@ -1329,7 +1922,12 @@ fn main() {
             open_path_in_os,
             get_metadata_paths, export_metadata_to, import_metadata_from,
             get_usage_report, get_session_usage, find_new_session_since, get_oauth_usage, get_cached_oauth_usage,
-            get_favorite_sessions, set_session_favorite
+            get_oauth_usages_per_account, get_cached_oauth_usages_per_account,
+            get_favorite_sessions, set_session_favorite,
+            get_accounts, add_account, remove_account, set_account_alias,
+            get_label_account_map, set_label_account_mapping,
+            get_session_account_map, set_session_account_mapping,
+            refresh_account_info, refresh_all_accounts, open_login_session_for_account
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
