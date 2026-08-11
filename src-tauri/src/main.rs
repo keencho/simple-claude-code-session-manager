@@ -737,10 +737,37 @@ fn kill_pty_tree(pty: &PtyInstance) {
     if let Ok(mut c) = pty.child.lock() { let _ = c.kill(); }
 }
 
+// Kill a batch of PTYs concurrently, off the main thread.
+//
+// Two things matter here:
+//   1. The callers are `async` commands. A *sync* #[tauri::command] runs on the
+//      main thread, so `taskkill`'s blocking `output()` (a few hundred ms per
+//      tree) froze the whole UI — a spinner could not even paint.
+//   2. Each tree is killed on its own blocking task, so closing a window with
+//      N panes costs one taskkill, not N in sequence.
+//
+// Entries stay in the map until their kill returns. If the app exits mid-kill,
+// the RunEvent::Exit fallback still sees them and reaps them synchronously;
+// killing an already-dead tree is a harmless no-op.
+async fn kill_terminals(ids: Vec<String>, state: &AppState) {
+    let targets: Vec<(String, Arc<PtyInstance>)> = {
+        let ptys = state.ptys.lock().unwrap();
+        ids.iter().filter_map(|id| ptys.get(id).map(|p| (id.clone(), p.clone()))).collect()
+    };
+    let jobs: Vec<_> = targets
+        .into_iter()
+        .map(|(id, pty)| tauri::async_runtime::spawn_blocking(move || { kill_pty_tree(&pty); id }))
+        .collect();
+    for job in jobs {
+        if let Ok(id) = job.await {
+            state.ptys.lock().unwrap().remove(&id);
+        }
+    }
+}
+
 #[tauri::command]
-fn pty_kill(terminal_id: String, state: State<AppState>) -> Result<(), String> {
-    let pty = state.ptys.lock().unwrap().remove(&terminal_id);
-    if let Some(pty) = pty { kill_pty_tree(&pty); }
+async fn pty_kill_many(terminal_ids: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
+    kill_terminals(terminal_ids, &state).await;
     Ok(())
 }
 
@@ -2013,7 +2040,7 @@ fn main() {
             set_labels, set_session_title,
             delete_session, delete_project_sessions,
             open_session,
-            pty_spawn, pty_write, pty_resize, pty_kill, pty_take_pending,
+            pty_spawn, pty_write, pty_resize, pty_kill_many, pty_take_pending,
             drop_tab, spawn_terminal,
             get_terminal_theme, set_terminal_theme,
             get_log_dir, set_log_dir, clear_logs,

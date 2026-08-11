@@ -795,12 +795,21 @@ function splitActiveSameSession() {
 }
 
 // ---------- Close pane / close tab ----------
+// Fire-and-forget PTY teardown. `pty_kill_many` runs taskkill on a background
+// thread, so awaiting it here would only stall the UI for no benefit — the
+// backend keeps the PTY registered until the kill returns, and RunEvent::Exit
+// reaps anything still alive if the app quits first. Nothing orphans.
+function killPtysInBackground(terminalIds: string[]) {
+  if (terminalIds.length === 0) return;
+  void invoke("pty_kill_many", { terminalIds }).catch(() => {});
+}
+
 async function closePane(terminalId: string) {
   const r = findPane(terminalId);
   if (!r) return;
   const { tab, pane, index } = r;
 
-  try { await invoke("pty_kill", { terminalId }); } catch {}
+  killPtysInBackground([terminalId]);
   pane.term.dispose();
 
   tab.panes.splice(index, 1);
@@ -828,10 +837,8 @@ async function closePane(terminalId: string) {
 async function closeTab(tabId: string) {
   const tab = tabs.get(tabId);
   if (!tab) return;
-  for (const p of tab.panes) {
-    try { await invoke("pty_kill", { terminalId: p.id }); } catch {}
-    p.term.dispose();
-  }
+  killPtysInBackground(tab.panes.map(p => p.id));
+  for (const p of tab.panes) p.term.dispose();
   tab.tabBtnEl.remove();
   tab.panesWrapEl.remove();
   tabs.delete(tabId);
@@ -1780,15 +1787,29 @@ function movePaneAcrossTabs(srcTab: Tab, srcIdx: number, dstTab: Tab, dstIdx: nu
 }
 
 // ---------- Window close: kill all PTYs ----------
+// Unlike closeTab, this one must actually wait: destroy() on the last window
+// exits the process, and a half-finished kill would leave a claude.exe orphan.
+// The kills run in parallel in the backend, but a tree can still take a beat,
+// so show an overlay if it does not finish promptly.
+function showClosingOverlay(): () => void {
+  const el = document.createElement("div");
+  el.className = "closing-overlay";
+  el.innerHTML = `<div class="closing-spinner"></div><div>세션 정리 중…</div>`;
+  // Delay the paint: most closes finish fast enough that flashing an overlay
+  // would look worse than a brief pause.
+  const timer = window.setTimeout(() => document.body.appendChild(el), 150);
+  return () => { window.clearTimeout(timer); el.remove(); };
+}
+
 getCurrentWindow().onCloseRequested(async (event) => {
   if (tabs.size === 0) return;
   event.preventDefault();
-  for (const tab of tabs.values()) {
-    for (const p of tab.panes) {
-      try { await invoke("pty_kill", { terminalId: p.id }); } catch {}
-    }
-  }
+  const ids: string[] = [];
+  for (const tab of tabs.values()) for (const p of tab.panes) ids.push(p.id);
   tabs.clear();
+  const hideOverlay = showClosingOverlay();
+  try { await invoke("pty_kill_many", { terminalIds: ids }); } catch {}
+  hideOverlay();
   await getCurrentWindow().destroy();
 });
 
