@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
 use uuid::Uuid;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
@@ -713,10 +713,34 @@ fn pty_resize(terminal_id: String, rows: u16, cols: u16, state: State<AppState>)
     Ok(())
 }
 
+// Kill a PTY together with everything it spawned.
+//
+// On Windows the direct child is the `cmd.exe` shim that wraps `claude`
+// (see pty_spawn), and there is no process-group semantics: `.kill()` reaps
+// only the shim, leaving the real `claude.exe` alive and reparented — a
+// ~400MB orphan per closed tab. `taskkill /T` walks the tree instead.
+// Killing the whole tree also closes the ConPTY pipe, which lets the reader
+// thread in pty_spawn return from its blocking read and actually exit.
+fn kill_pty_tree(pty: &PtyInstance) {
+    #[cfg(windows)]
+    {
+        let pid = pty.child.lock().ok().and_then(|c| c.process_id());
+        if let Some(pid) = pid {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .output();
+        }
+    }
+    // Still reap the direct child: on Unix this is the actual kill, and on
+    // Windows it releases the handle if taskkill could not resolve the pid.
+    if let Ok(mut c) = pty.child.lock() { let _ = c.kill(); }
+}
+
 #[tauri::command]
 fn pty_kill(terminal_id: String, state: State<AppState>) -> Result<(), String> {
     let pty = state.ptys.lock().unwrap().remove(&terminal_id);
-    if let Some(pty) = pty { let _ = pty.child.lock().unwrap().kill(); }
+    if let Some(pty) = pty { kill_pty_tree(&pty); }
     Ok(())
 }
 
@@ -2005,8 +2029,23 @@ fn main() {
             get_session_account_map, set_session_account_mapping,
             refresh_account_info, refresh_all_accounts, open_login_session_for_account
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        // Last-resort PTY cleanup. The frontend kills PTYs in onCloseRequested,
+        // but that never runs when a window is destroyed directly or the webview
+        // dies, so any PTY still registered here would be orphaned on exit.
+        .run(|app, event| {
+            if let RunEvent::Exit = event {
+                let Some(state) = app.try_state::<AppState>() else { return };
+                // Drain first, then kill outside the lock: taskkill blocks on
+                // output() and must not hold the map while doing so.
+                let leftover: Vec<Arc<PtyInstance>> = match state.ptys.lock() {
+                    Ok(mut m) => m.drain().map(|(_, v)| v).collect(),
+                    Err(_) => return,
+                };
+                for pty in &leftover { kill_pty_tree(pty); }
+            }
+        });
 }
 
 #[cfg(test)]
