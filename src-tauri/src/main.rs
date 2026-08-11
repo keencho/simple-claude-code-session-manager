@@ -726,10 +726,19 @@ fn kill_pty_tree(pty: &PtyInstance) {
     {
         let pid = pty.child.lock().ok().and_then(|c| c.process_id());
         if let Some(pid) = pid {
+            // Spawn and walk away — do NOT use `.output()`. That waits for
+            // taskkill to exit *and* for its stdout/stderr pipes to reach EOF,
+            // which measured ~9.8s per tree and froze the close path solid.
+            // Spawning alone costs ~10ms, and taskkill is an independent
+            // process: it finishes reaping the tree whether or not we are still
+            // alive, so nothing orphans. Null stdio so no pipes exist at all.
             let _ = std::process::Command::new("taskkill")
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .creation_flags(0x08000000) // CREATE_NO_WINDOW
-                .output();
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
         }
     }
     // Still reap the direct child: on Unix this is the actual kill, and on
@@ -737,18 +746,16 @@ fn kill_pty_tree(pty: &PtyInstance) {
     if let Ok(mut c) = pty.child.lock() { let _ = c.kill(); }
 }
 
-// Kill a batch of PTYs concurrently, off the main thread.
+// Kill a batch of PTYs off the main thread.
 //
-// Two things matter here:
-//   1. The callers are `async` commands. A *sync* #[tauri::command] runs on the
-//      main thread, so `taskkill`'s blocking `output()` (a few hundred ms per
-//      tree) froze the whole UI — a spinner could not even paint.
-//   2. Each tree is killed on its own blocking task, so closing a window with
-//      N panes costs one taskkill, not N in sequence.
+// This is an `async` command on purpose: a *sync* #[tauri::command] runs on the
+// main thread, so any cost here lands directly on the UI. kill_pty_tree is cheap
+// now, but spawning a process is still a syscall per pane, so it stays on the
+// blocking pool and the panes go in parallel.
 //
 // Entries stay in the map until their kill returns. If the app exits mid-kill,
-// the RunEvent::Exit fallback still sees them and reaps them synchronously;
-// killing an already-dead tree is a harmless no-op.
+// the RunEvent::Exit fallback still sees them and reaps them; killing an
+// already-dead tree is a harmless no-op.
 async fn kill_terminals(ids: Vec<String>, state: &AppState) {
     let targets: Vec<(String, Arc<PtyInstance>)> = {
         let ptys = state.ptys.lock().unwrap();
@@ -760,6 +767,7 @@ async fn kill_terminals(ids: Vec<String>, state: &AppState) {
         .collect();
     for job in jobs {
         if let Ok(id) = job.await {
+            // Dropping the entry also drops the ConPTY master.
             state.ptys.lock().unwrap().remove(&id);
         }
     }
@@ -2064,8 +2072,10 @@ fn main() {
         .run(|app, event| {
             if let RunEvent::Exit = event {
                 let Some(state) = app.try_state::<AppState>() else { return };
-                // Drain first, then kill outside the lock: taskkill blocks on
-                // output() and must not hold the map while doing so.
+                // Drain first, then kill outside the lock. This runs on the main
+                // thread during shutdown, which is only acceptable because
+                // kill_pty_tree merely spawns taskkill (~10ms) instead of
+                // waiting on it — see the note there.
                 let leftover: Vec<Arc<PtyInstance>> = match state.ptys.lock() {
                     Ok(mut m) => m.drain().map(|(_, v)| v).collect(),
                     Err(_) => return,
