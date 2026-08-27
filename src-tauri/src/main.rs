@@ -114,10 +114,234 @@ impl Serialize for Labels {
 
 // --- PTY types ---
 
+// ---------- Windows Job Object: kernel-guaranteed tree cleanup ----------
+//
+// `taskkill /T` walks the tree that exists *at the moment it runs*. That is the
+// wrong shape for this problem: when the PTY's `claude.exe` exits on its own
+// (session end, crash, /exit), Windows does not cascade the death to its
+// children, so the MCP servers it spawned are orphaned instantly. By the time a
+// tab close calls taskkill, the walk starts from a pid that is already gone and
+// reaps nothing. Measured on 2026-08-27: ~100 orphaned `npx @jetbrains/mcp-proxy`
+// processes accumulated over 44h, ~6GB of commit, still growing ~1/min.
+//
+// A job object does not walk anything. Every process assigned to the job - and
+// everything they spawn, transitively - is a member, and membership cannot be
+// escaped. With JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, closing the last handle to
+// the job terminates every member atomically. That holds when the tree exits
+// cleanly, when an intermediate process dies first, and when this app is killed
+// outright: process teardown closes our handles for us. Chrome and VS Code use
+// the same mechanism.
+//
+// Raw FFI on purpose - this needs five kernel32 calls and no new dependency.
+#[cfg(windows)]
+mod job {
+    use std::os::raw::c_void;
+
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const PROCESS_SET_QUOTA: u32 = 0x0100;
+
+    #[repr(C)]
+    struct IoCounters {
+        read_op: u64,
+        write_op: u64,
+        other_op: u64,
+        read_tx: u64,
+        write_tx: u64,
+        other_tx: u64,
+    }
+
+    #[repr(C)]
+    struct BasicLimitInformation {
+        per_process_user_time: i64,
+        per_job_user_time: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    struct ExtendedLimitInformation {
+        basic_limit_information: BasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(attrs: *mut c_void, name: *const u16) -> *mut c_void;
+        fn SetInformationJobObject(
+            job: *mut c_void,
+            class: i32,
+            info: *const c_void,
+            len: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    // Owns the job handle. Dropping it closes the handle, which is what actually
+    // kills the tree - so it must outlive the PTY it guards, i.e. it lives in
+    // PtyInstance and dies when the instance leaves AppState::ptys.
+    pub struct JobHandle(*mut c_void);
+
+    // The handle is only ever closed (in Drop) or passed to AssignProcessToJob-
+    // Object, both of which the kernel serializes internally.
+    unsafe impl Send for JobHandle {}
+    unsafe impl Sync for JobHandle {}
+
+    impl Drop for JobHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // Closing the last handle is what triggers KILL_ON_JOB_CLOSE.
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    /// Create an unnamed job that kills all members when its last handle closes.
+    pub fn create_kill_on_close() -> Option<JobHandle> {
+        let h = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+        if h.is_null() {
+            return None;
+        }
+        let mut info: ExtendedLimitInformation = unsafe { std::mem::zeroed() };
+        info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = unsafe {
+            SetInformationJobObject(
+                h,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                &info as *const _ as *const c_void,
+                std::mem::size_of::<ExtendedLimitInformation>() as u32,
+            )
+        };
+        if ok == 0 {
+            // Without the flag the job kills nothing, so it is worse than
+            // useless - drop it and let the taskkill path handle cleanup.
+            unsafe { CloseHandle(h) };
+            return None;
+        }
+        Some(JobHandle(h))
+    }
+
+    /// Put `pid` (and everything it goes on to spawn) into the job.
+    ///
+    /// Nested jobs are supported since Windows 8, so this succeeds even when the
+    /// target already belongs to another job.
+    pub fn assign_pid(job: &JobHandle, pid: u32) -> bool {
+        let proc = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+        if proc.is_null() {
+            return false;
+        }
+        let ok = unsafe { AssignProcessToJobObject(job.0, proc) };
+        unsafe { CloseHandle(proc) };
+        ok != 0
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // A wrong #[repr(C)] layout here would not fail to compile - it would
+        // hand SetInformationJobObject a garbage limit_flags and silently give
+        // us a job that kills nothing, which is exactly the bug this module
+        // exists to fix. Pin the offsets against the Win32 SDK definition.
+        #[test]
+        fn extended_limit_information_matches_win32_layout() {
+            use std::mem::{align_of, size_of};
+
+            // x64: 8-byte alignment throughout, two 4-byte holes in the basic
+            // struct (after limit_flags and after active_process_limit).
+            assert_eq!(size_of::<BasicLimitInformation>(), 64);
+            assert_eq!(size_of::<IoCounters>(), 48);
+            assert_eq!(size_of::<ExtendedLimitInformation>(), 144);
+            assert_eq!(align_of::<ExtendedLimitInformation>(), 8);
+        }
+
+        // The flag is what makes the job lethal; a typo yields a job that
+        // silently leaks instead of reaping.
+        #[test]
+        fn kill_on_job_close_flag_value() {
+            assert_eq!(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0x2000);
+            assert_eq!(JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, 9);
+        }
+
+        // End-to-end: a job with the flag set must reap a real process tree the
+        // moment its last handle closes, with no taskkill involved.
+        #[test]
+        fn dropping_the_job_kills_the_spawned_tree() {
+            use std::os::windows::process::CommandExt;
+            use std::process::{Command, Stdio};
+
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+            let jh = create_kill_on_close().expect("job creation failed");
+            // Long-lived child so it is definitely alive when we drop the job.
+            let mut child = Command::new("cmd.exe")
+                .args(["/c", "timeout", "/t", "30", "/nobreak"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn failed");
+            let pid = child.id();
+            assert!(assign_pid(&jh, pid), "assign to job failed");
+            assert!(
+                child.try_wait().expect("try_wait failed").is_none(),
+                "child died before the job was dropped"
+            );
+
+            drop(jh); // closing the last handle must terminate the member
+
+            // Termination is synchronous from the kernel's side, but the exit
+            // status still has to be reaped; poll briefly rather than sleep a
+            // fixed amount.
+            let mut exited = false;
+            for _ in 0..50 {
+                if child.try_wait().expect("try_wait failed").is_some() {
+                    exited = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if !exited {
+                let _ = child.kill();
+            }
+            assert!(exited, "job did not kill its member on handle close");
+        }
+    }
+}
+
+// Non-Windows stub so PtyInstance and pty_spawn stay platform-independent.
+// Unix already has real process groups; portable-pty's kill covers it there.
+#[cfg(not(windows))]
+mod job {
+    pub struct JobHandle;
+    pub fn create_kill_on_close() -> Option<JobHandle> {
+        None
+    }
+    pub fn assign_pid(_job: &JobHandle, _pid: u32) -> bool {
+        false
+    }
+}
+
 struct PtyInstance {
     master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
+    // Kills the whole spawned tree when this instance is dropped. None when the
+    // job could not be created (or on non-Windows); kill_pty_tree still runs.
+    _job: Option<job::JobHandle>,
 }
 
 #[derive(Clone, Serialize)]
@@ -658,9 +882,23 @@ fn pty_spawn(
     }
     let child = pair.slave.spawn_command(cmd).map_err(|e| format!("spawn failed: {}", e))?;
     drop(pair.slave);
+    // Cage the child immediately, before `cmd.exe /c claude` has had time to
+    // start Node and its MCP servers, so the entire tree becomes a job member
+    // and dies with the handle instead of depending on a taskkill walk that a
+    // dead intermediate process would break. Best effort throughout: on any
+    // failure we drop the job and fall back to kill_pty_tree.
+    let job = match job::create_kill_on_close() {
+        Some(j) => match child.process_id() {
+            Some(pid) if job::assign_pid(&j, pid) => Some(j),
+            // Job holds nothing, so keeping the handle would only be
+            // misleading about who is responsible for cleanup.
+            _ => None,
+        },
+        None => None,
+    };
     let mut reader = pair.master.try_clone_reader().map_err(|e| format!("clone reader failed: {}", e))?;
     let writer = pair.master.take_writer().map_err(|e| format!("take writer failed: {}", e))?;
-    let instance = Arc::new(PtyInstance { master: Mutex::new(pair.master), writer: Mutex::new(writer), child: Mutex::new(child) });
+    let instance = Arc::new(PtyInstance { master: Mutex::new(pair.master), writer: Mutex::new(writer), child: Mutex::new(child), _job: job });
     state.ptys.lock().unwrap().insert(terminal_id.clone(), instance);
     // When claude_verbose is on, tee PTY output to a timestamped log file.
     let verbose = load_config().claude_verbose.unwrap_or(false);
@@ -714,6 +952,12 @@ fn pty_resize(terminal_id: String, rows: u16, cols: u16, state: State<AppState>)
 }
 
 // Kill a PTY together with everything it spawned.
+//
+// Since pty_spawn assigns the child to a kill-on-close job object, dropping the
+// PtyInstance already reaps the tree in the kernel; this is the belt to that
+// braces. It still earns its place: it covers a job that failed to be created,
+// and the sub-millisecond window between spawn_command and AssignProcessToJob-
+// Object in which a grandchild could in principle escape.
 //
 // On Windows the direct child is the `cmd.exe` shim that wraps `claude`
 // (see pty_spawn), and there is no process-group semantics: `.kill()` reaps
