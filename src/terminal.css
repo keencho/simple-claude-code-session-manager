@@ -545,3 +545,71 @@ body.dragging-divider .pane-divider::before {
 @keyframes closing-spin {
   to { transform: rotate(360deg); }
 }
+
+/* ---------- Scrollback 검색 바 (Ctrl+F) ---------- */
+/* .term-pane이 position: relative 이므로 그 안에 절대 배치한다. */
+.find-bar {
+  position: absolute;
+  top: 6px;
+  right: 14px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-2);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+
+/* pane 헤더가 실제로 보일 때만 그 아래로 내린다.
+   헤더는 .multi 뿐 아니라 zoom 상태에서도 뜨므로 .pane-header-visible을 직접 본다.
+   (헤더 24px + border 1px) */
+.term-pane:has(.pane-header-visible) .find-bar { top: 31px; }
+
+.find-input {
+  width: 180px;
+  padding: 3px 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: var(--bg-3);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 12px;
+  outline: none;
+}
+
+.find-input:focus { border-color: var(--accent); }
+
+.find-count {
+  min-width: 52px;
+  padding: 0 2px;
+  color: var(--fg-dim);
+  font-size: 11px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.find-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+
+.find-btn:hover { background: var(--bg-4); color: var(--fg); }
+
+.find-close:hover {
+  background: color-mix(in srgb, var(--danger) 22%, transparent);
+  color: var(--danger);
+}

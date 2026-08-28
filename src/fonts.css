@@ -1,6 +1,18 @@
 /*
- * Cascadia Code — sole terminal font.
- * Latin: 번들 (@fontsource, SIL OFL). 한글은 시스템 fallback (맑은 고딕 등).
+ * 터미널 폰트.
+ *
+ * Latin: Cascadia Code — 번들 (@fontsource, SIL OFL).
+ * 한글: 나눔고딕코딩 — 번들 (@fontsource, SIL OFL).
+ *
+ * 한글을 번들하는 이유: Cascadia Code에는 한글 글리프가 아예 없다
+ * (제공 subset: latin / latin-ext / cyrillic / greek / hebrew / arabic /
+ *  vietnamese / braille / symbols2 — 한글 없음).
+ * 예전에는 시스템 맑은 고딕으로 폴백했는데, 맑은 고딕은 고정폭 폰트가
+ * 아니라서 한글의 advance width가 xterm 셀 격자의 정확히 2배가 아니다.
+ * 그래서 한글이 섞인 줄에서 글자가 격자에서 미세하게 어긋났다.
+ * 나눔고딕코딩은 한글 = Latin 2배로 설계된 고정폭 코딩 폰트라 격자에 맞는다.
  */
 @import "@fontsource/cascadia-code/latin-400.css";
 @import "@fontsource/cascadia-code/latin-700.css";
+@import "@fontsource/nanum-gothic-coding/korean-400.css";
+@import "@fontsource/nanum-gothic-coding/korean-700.css";

@@ -540,4 +540,9 @@ export function applyUiTheme(ui: UiTheme) {
 
 // ---------- Font ----------
 // Cascadia Code (Latin) + 시스템 한글 fallback.
-export const TERMINAL_FONT = '"Cascadia Code", "Cascadia Mono", "Malgun Gothic", "Apple SD Gothic Neo", monospace';
+// Latin은 Cascadia Code, 한글은 고정폭 코딩 폰트로 받는다.
+// D2Coding은 설치돼 있으면 쓰고(한국 개발자 다수가 보유), 없으면 번들한
+// 나눔고딕코딩으로 떨어진다. 둘 다 한글 = Latin 2배 폭으로 설계돼 있어
+// xterm의 셀 격자와 맞는다.
+// 맑은 고딕은 고정폭이 아니라 격자가 틀어지므로 최후의 폴백으로만 남긴다.
+export const TERMINAL_FONT = '"Cascadia Code", "Cascadia Mono", "D2Coding", "Nanum Gothic Coding", "Malgun Gothic", "Apple SD Gothic Neo", monospace';

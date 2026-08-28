@@ -843,6 +843,25 @@ async fn open_session(
     Ok(())
 }
 
+// WebView2의 기본 F12 액셀러레이터는 Tauri 창에서 동작하지 않는다.
+// 그래서 프런트에서 F12를 잡아 이 커맨드를 직접 부른다.
+// 릴리스 빌드에는 devtools 자체가 없으므로 no-op.
+#[tauri::command]
+fn toggle_devtools(window: tauri::WebviewWindow) {
+    #[cfg(debug_assertions)]
+    {
+        if window.is_devtools_open() {
+            window.close_devtools();
+        } else {
+            window.open_devtools();
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = window;
+    }
+}
+
 #[tauri::command]
 fn pty_take_pending(window_label: String, state: State<AppState>) -> Option<AddTabPayload> {
     state.pending_tabs.lock().unwrap().remove(&window_label)
@@ -2293,6 +2312,7 @@ fn main() {
             delete_session, delete_project_sessions,
             open_session,
             pty_spawn, pty_write, pty_resize, pty_kill_many, pty_take_pending,
+            toggle_devtools,
             drop_tab, spawn_terminal,
             get_terminal_theme, set_terminal_theme,
             get_log_dir, set_log_dir, clear_logs,

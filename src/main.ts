@@ -2181,3 +2181,12 @@ if (!IS_TERMINAL_WINDOW) {
     listen("statusbar-toggle-request", () => setStatusBarVisible(!statusBarVisible));
   })();
 }
+
+// ---------- F12 → devtools ----------
+// WebView2의 기본 F12 액셀러레이터는 Tauri 창에서 동작하지 않는다.
+// 릴리스 빌드에서는 Rust 쪽 커맨드가 no-op이라 아무 일도 일어나지 않는다.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "F12") return;
+  e.preventDefault();
+  void invoke("toggle_devtools");
+});

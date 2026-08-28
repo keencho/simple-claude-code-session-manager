@@ -1,10 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SerializeAddon } from "@xterm/addon-serialize";
+import { WebglAddon } from "@xterm/addon-webgl";
+import { SearchAddon } from "@xterm/addon-search";
+import { UnicodeGraphemesAddon } from "@xterm/addon-unicode-graphemes";
+import { ClipboardAddon } from "@xterm/addon-clipboard";
 import "@xterm/xterm/css/xterm.css";
 import "./terminal.css";
 import "./fonts.css";
@@ -77,6 +82,9 @@ interface Pane {
   term: Terminal;
   fit: FitAddon;
   serialize: SerializeAddon;
+  search: SearchAddon;
+  // WebGL 컨텍스트를 잃으면 dispose하고 null로 떨어뜨린다(= DOM 렌더러로 복귀).
+  webgl: WebglAddon | null;
   exited: boolean;
 }
 
@@ -120,6 +128,10 @@ let currentTheme: TerminalTheme = getTheme(null);
 applyUiTheme(currentTheme.ui);
 
 const scoped = { target: { kind: "AnyLabel" as const, label: myLabel } };
+
+// 프로그래밍 폰트가 리가처를 만드는 연산자 문자들의 연속 구간.
+// $ @ % 는 셸 출력에 자주 나오고 리가처도 거의 없어서 뺐다.
+const LIGATURE_RUN = /[=!<>+*/&|~^:.?#;-]{2,}/g;
 
 const CLOSE_SVG = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>`;
 const ZOOM_OUT_SVG = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M9 3h6M3 9v6m0-6h6M3 9l6 6m12-6v6m0-6h-6m6 0l-6 6M9 21H3m0 0v-6"/></svg>`;
@@ -203,6 +215,20 @@ function normalizeRatios(tab: Tab) {
   const sum = tab.ratios.reduce((a, b) => a + b, 0);
   if (sum > 0) tab.ratios = tab.ratios.map(r => r / sum);
   else tab.ratios = tab.panes.map(() => 1 / tab.panes.length);
+}
+
+// ---------- 링크 열기 ----------
+// 터미널 안의 링크는 반드시 OS에 넘겨야 한다. 웹뷰의 window.open을 쓰면
+// 앱 자체가 그 URL로 이동해버릴 수 있다.
+// OSC 8은 임의의 스킴을 실어보낼 수 있으므로 화이트리스트로 거른다.
+const SAFE_LINK_SCHEMES = new Set(["http:", "https:", "file:", "mailto:"]);
+
+function openLink(uri: string) {
+  let scheme: string;
+  try { scheme = new URL(uri).protocol; }
+  catch { return; }
+  if (!SAFE_LINK_SCHEMES.has(scheme)) return;
+  void openExternal(uri).catch(() => {});
 }
 
 // ---------- Theme hot-swap ----------
@@ -487,13 +513,34 @@ function createPane(init: { id: string; baseTitle: string; title: string; sshArg
     fontSize: FONT_DEFAULT,
     cursorBlink: true,
     cursorStyle: "block",
-    scrollback: 10000,
+    scrollback: 50000,
     allowProposedApi: true,
-    minimumContrastRatio: 4.5,
+    // minimumContrastRatio를 1보다 크게 두면 xterm이 대비를 맞추려고 색을
+    // 임의로 밝게 끌어올린다. Claude Code가 의도한 흐린 힌트 텍스트나 diff
+    // 배경이 원본과 다르게 보이는 원인이라 끈다(1 = 보정 없음).
+    minimumContrastRatio: 1,
     lineHeight: 1.08,
+    // 기본 구분자에는 / . : 가 들어있어서 `src/terminal.ts:1379` 같은 경로를
+    // 더블클릭으로 한 번에 잡지 못한다. 공백류만 구분자로 둔다.
+    wordSeparator: " ()[]{}',\"`",
+    // OSC 8 하이퍼링크(Claude Code가 파일 경로 등에 붙인다) 클릭 처리.
+    // WebLinksAddon은 정규식으로 찾은 http(s)만 보므로 그것과는 별개다.
+    linkHandler: {
+      activate: (_ev, text) => openLink(text),
+      // file:// 같은 비-HTTP 스킴도 받아야 파일 경로 링크가 동작한다.
+      // 임의 스킴이 그대로 셸에 넘어가지 않도록 openLink에서 화이트리스트를 건다.
+      allowNonHttpProtocols: true,
+    },
   });
   term.attachCustomKeyEventHandler((ev) => {
     if (ev.type !== "keydown") return true;
+    // IME 조합 중에는 무조건 xterm에 넘긴다.
+    // xterm의 _keyDown은 이 핸들러를 _compositionHelper.keydown()보다 *먼저* 부른다.
+    // 여기서 false를 반환하면 CompositionHelper가 통째로 스킵되는데, 그러면
+    //  - _finalizeComposition(false)로 취소돼야 할 setTimeout 전송이 살아남아 → 글자 중복
+    //  - keyCode 229 경로(_handleAnyTextareaChanges)가 안 돌아 → 글자 누락
+    // 둘 다 발생한다. 조합 중 키는 전부 xterm이 처리해야 한다.
+    if (ev.isComposing || ev.keyCode === 229) return true;
     // Shift+Enter / Ctrl+Enter → Option+Enter sequence (ESC+CR), which
     // Claude Code CLI interprets as "insert newline in prompt".
     if (ev.key === "Enter" && (ev.shiftKey || ev.ctrlKey) && !ev.altKey && !ev.metaKey) {
@@ -508,10 +555,58 @@ function createPane(init: { id: string; baseTitle: string; title: string; sshArg
   });
   const fit = new FitAddon();
   const serialize = new SerializeAddon();
+  const search = new SearchAddon();
   term.loadAddon(fit);
-  term.loadAddon(new WebLinksAddon());
+  term.loadAddon(new WebLinksAddon((_ev, uri) => openLink(uri)));
   term.loadAddon(serialize);
+  term.loadAddon(search);
+  // OSC 52 — CLI가 클립보드에 쓸 수 있게 한다.
+  term.loadAddon(new ClipboardAddon());
+  // 이모지/조합 문자/한글의 셀 폭을 최신 규칙으로 계산한다. 이게 없으면
+  // 박스 드로잉과 이모지가 섞인 줄에서 폭이 1칸씩 어긋난다.
+  term.loadAddon(new UnicodeGraphemesAddon());
+  term.unicode.activeVersion = "15-graphemes";
   term.open(xtermEl);
+
+  // ---- 리가처 ----
+  // Cascadia Code는 리가처 폰트인데 xterm은 셀 단위로 그려서 =>, !=, -> 가
+  // 붙지 않는다. registerCharacterJoiner로 "이 구간은 한 덩어리"라고 알려주면
+  // 브라우저 텍스트 셰이핑이 폰트의 리가처를 적용한다. open() 이후에만 호출 가능.
+  //
+  // 공식 @xterm/addon-ligatures는 쓸 수 없다 — 의존하는 font-finder /
+  // font-ligatures가 파일시스템에서 폰트를 읽는 Node 전용 패키지라
+  // 웹뷰에서 동작하지 않는다. 그래서 연산자 문자 런을 직접 잇는다.
+  // 폰트에 해당 리가처가 없으면 그냥 원래대로 그려지므로 손해는 없다.
+  term.registerCharacterJoiner((text) => {
+    const ranges: [number, number][] = [];
+    LIGATURE_RUN.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = LIGATURE_RUN.exec(text)) !== null) {
+      ranges.push([m.index, m.index + m[0].length]);
+    }
+    return ranges;
+  });
+
+  // WebGL 렌더러는 반드시 open() 이후에 붙인다.
+  // 기본 DOM 렌더러는 선택 영역을 마우스 이동마다 span으로 다시 만들기 때문에
+  // 드래그 선택과 스크롤이 눈에 띄게 밀린다. WebGL은 텍스처 아틀라스 + GPU라
+  // 그 비용이 사라지고, 한글처럼 폭이 다른 글리프도 셀 격자에 맞춰 그린다.
+  let webgl: WebglAddon | null = null;
+  try {
+    const w = new WebglAddon();
+    // 컨텍스트 손실(GPU 리셋, 드라이버 갱신 등)은 정상적으로 일어날 수 있다.
+    // 이때 addon을 붙들고 있으면 화면이 죽으므로 버리고 DOM 렌더러로 돌아간다.
+    w.onContextLoss(() => {
+      w.dispose();
+      if (pane) pane.webgl = null;
+    });
+    term.loadAddon(w);
+    webgl = w;
+  } catch {
+    // WebGL을 못 쓰는 환경(원격 데스크톱, 소프트웨어 렌더링 등)에서는
+    // 조용히 DOM 렌더러로 둔다. 느릴 뿐 동작에는 문제가 없다.
+    webgl = null;
+  }
 
   const pane: Pane = {
     id: init.id,
@@ -521,14 +616,17 @@ function createPane(init: { id: string; baseTitle: string; title: string; sshArg
     cwd: init.cwd,
     fontSize: FONT_DEFAULT,
     paneEl, headerEl, xtermEl,
-    term, fit, serialize,
+    term, fit, serialize, search, webgl,
     env: init.env,
     accountName: init.accountName ?? null,
     exited: false,
   };
 
   // Focus on click anywhere in pane (resolve current tab dynamically)
-  paneEl.addEventListener("mousedown", () => {
+  paneEl.addEventListener("mousedown", (e) => {
+    // find bar 안을 클릭한 경우엔 터미널로 포커스를 되돌리면 안 된다.
+    // (되돌리면 검색어를 한 글자도 못 친다)
+    if ((e.target as HTMLElement).closest(".find-bar")) return;
     const r = findPane(pane.id);
     if (!r) return;
     const { tab } = r;
@@ -809,6 +907,7 @@ async function closePane(terminalId: string) {
   if (!r) return;
   const { tab, pane, index } = r;
 
+  closeFindIfPane(terminalId);
   killPtysInBackground([terminalId]);
   pane.term.dispose();
 
@@ -1044,6 +1143,108 @@ async function pasteToActive() {
   sendTextToActivePty(text);
 }
 
+// ---------- Scrollback 검색 (Ctrl+F) ----------
+// 활성 pane 위에 떠 있는 작은 find bar. pane 하나당 하나만 뜨고,
+// 다른 pane에서 다시 열면 이전 것은 정리한다.
+interface FindBar {
+  el: HTMLElement;
+  input: HTMLInputElement;
+  countEl: HTMLElement;
+  paneId: string;
+  // onDidChangeResults 구독. 닫을 때 반드시 끊어야 한다 —
+  // 안 그러면 find bar를 열 때마다 같은 pane에 구독이 쌓인다.
+  resultsSub: { dispose(): void };
+}
+let findBar: FindBar | null = null;
+
+function searchDecorations() {
+  const accent = currentTheme.ui.accent;
+  return {
+    matchBackground: currentTheme.ui.bg4,
+    matchOverviewRuler: accent,
+    activeMatchBackground: accent,
+    activeMatchColorOverviewRuler: accent,
+  };
+}
+
+function runFind(dir: 1 | -1) {
+  if (!findBar) return;
+  const r = findPane(findBar.paneId);
+  if (!r) { closeFind(); return; }
+  const term = findBar.input.value;
+  if (!term) { r.pane.search.clearDecorations(); findBar.countEl.textContent = ""; return; }
+  const opts = { decorations: searchDecorations(), incremental: dir === 1 };
+  if (dir === 1) r.pane.search.findNext(term, opts);
+  else r.pane.search.findPrevious(term, { ...opts, incremental: false });
+}
+
+function closeFind(refocus = true) {
+  if (!findBar) return;
+  const r = findPane(findBar.paneId);
+  r?.pane.search.clearDecorations();
+  findBar.resultsSub.dispose();
+  findBar.el.remove();
+  const paneId = findBar.paneId;
+  findBar = null;
+  if (refocus) findPane(paneId)?.pane.term.focus();
+}
+
+// pane이 닫히거나 탭이 바뀔 때 남은 find bar를 치운다.
+function closeFindIfPane(paneId: string) {
+  if (findBar && findBar.paneId === paneId) closeFind(false);
+}
+
+function openFind() {
+  const ap = getActivePane();
+  if (!ap) return;
+  // 이미 같은 pane에 열려 있으면 입력만 다시 잡는다.
+  if (findBar && findBar.paneId === ap.pane.id) { findBar.input.select(); findBar.input.focus(); return; }
+  closeFind(false);
+
+  const el = document.createElement("div");
+  el.className = "find-bar";
+  el.innerHTML = `
+    <input class="find-input" type="text" placeholder="검색" spellcheck="false" />
+    <span class="find-count"></span>
+    <button class="find-btn find-prev" title="이전 (Shift+Enter)">&#8593;</button>
+    <button class="find-btn find-next" title="다음 (Enter)">&#8595;</button>
+    <button class="find-btn find-close" title="닫기 (Esc)">${CLOSE_SVG}</button>
+  `;
+  ap.pane.paneEl.appendChild(el);
+
+  const input = el.querySelector(".find-input") as HTMLInputElement;
+  const countEl = el.querySelector(".find-count") as HTMLElement;
+  const resultsSub = ap.pane.search.onDidChangeResults(({ resultIndex, resultCount }) => {
+    if (!findBar || findBar.paneId !== ap.pane.id) return;
+    findBar.countEl.textContent = resultCount === 0
+      ? (findBar.input.value ? "결과 없음" : "")
+      : `${resultIndex + 1}/${resultCount}`;
+  });
+  findBar = { el, input, countEl, paneId: ap.pane.id, resultsSub };
+
+  // 선택된 텍스트가 있으면 검색어로 미리 채운다.
+  if (ap.pane.term.hasSelection()) {
+    const sel = ap.pane.term.getSelection();
+    if (sel && !sel.includes("\n")) input.value = sel;
+  }
+
+  input.addEventListener("input", () => runFind(1));
+  // 검색창 안에서는 앱 단축키가 아니라 검색 조작이 우선이다.
+  input.addEventListener("keydown", (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); runFind(e.shiftKey ? -1 : 1); }
+    else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeFind(); }
+  }, { capture: true });
+
+  el.querySelector(".find-prev")!.addEventListener("click", () => runFind(-1));
+  el.querySelector(".find-next")!.addEventListener("click", () => runFind(1));
+  el.querySelector(".find-close")!.addEventListener("click", () => closeFind());
+
+  input.select();
+  input.focus();
+  if (input.value) runFind(1);
+}
+
 function hasSelectionInActivePane(): boolean {
   const ap = getActivePane();
   return !!ap && ap.pane.term.hasSelection();
@@ -1060,6 +1261,9 @@ function isOurShortcut(e: KeyboardEvent): boolean {
   if (e.ctrlKey && !e.shiftKey && !e.altKey && e.code === "KeyC" && hasSelectionInActivePane()) return true;
   if (e.ctrlKey && !e.shiftKey && !e.altKey && e.code === "KeyV") return true;
   if (e.altKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) return true;
+  if (e.ctrlKey && !e.altKey && e.code === "KeyF") return true;
+  // F12를 xterm이 PTY로 흘려보내지 않게 막는다.
+  if (e.key === "F12") return true;
   return false;
 }
 
@@ -1108,6 +1312,16 @@ function handleShortcut(e: KeyboardEvent): boolean {
     void pasteToActive();
     return true;
   }
+  if (e.ctrlKey && !e.altKey && e.code === "KeyF") {
+    e.preventDefault();
+    openFind();
+    return true;
+  }
+  if (e.key === "F12") {
+    e.preventDefault();
+    void invoke("toggle_devtools");
+    return true;
+  }
   if (e.altKey && e.shiftKey && !e.ctrlKey) {
     if (e.key === "ArrowLeft") { e.preventDefault(); resizeActiveDivider(-0.03); return true; }
     if (e.key === "ArrowRight") { e.preventDefault(); resizeActiveDivider(+0.03); return true; }
@@ -1119,8 +1333,19 @@ function handleShortcut(e: KeyboardEvent): boolean {
   return false;
 }
 
-// Run in capture phase so we beat xterm's own handlers
-document.addEventListener("keydown", (e) => { handleShortcut(e); }, { capture: true });
+// Run in capture phase so we beat xterm's own handlers.
+// 단, IME 조합 중에는 손대지 않는다: 조합 중에도 e.code는 물리 키 그대로라
+// 단축키로 오인해 preventDefault()를 부르면 한글 조합이 깨진다.
+document.addEventListener("keydown", (e) => {
+  if (e.isComposing || e.keyCode === 229) return;
+  // 진짜 입력 필드(find bar, 세션 피커 검색창 등)에 포커스가 있으면 손대지 않는다.
+  // 안 그러면 Ctrl+V가 입력창이 아니라 PTY로 가버린다.
+  // xterm의 숨은 textarea는 예외 — 그건 터미널 입력이므로 단축키가 적용돼야 한다.
+  const t = e.target as HTMLElement | null;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")
+        && !t.classList.contains("xterm-helper-textarea")) return;
+  handleShortcut(e);
+}, { capture: true });
 
 // ---------- Tab DnD (reorder within tab bar + drag-out for detach/merge) ----------
 let dragSrcTabEl: HTMLElement | null = null;
