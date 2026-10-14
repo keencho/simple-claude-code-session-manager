@@ -885,6 +885,9 @@ async fn open_session(
     }
     if skip_permissions {
         args.push("--dangerously-skip-permissions".to_string());
+    } else {
+        // Starts in auto (the CLI default); keeps bypass reachable via Shift+Tab.
+        args.push("--allow-dangerously-skip-permissions".to_string());
     }
 
     // Resolve which account this session belongs to.
