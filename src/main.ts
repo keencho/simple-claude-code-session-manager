@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, emit } from "@tauri-apps/api/event";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open, save, ask } from "@tauri-apps/plugin-dialog";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
@@ -419,6 +421,25 @@ function renderUsageStatus(_report: UsageReport | null) {
   }
 
   el.innerHTML = html;
+}
+
+// Installing restarts the app and kills every open claude PTY, so always ask first.
+async function checkForUpdate() {
+  try {
+    const update = await check();
+    if (!update) return;
+    const ok = await ask(
+      `새 버전 ${update.version} 이 있습니다 (현재 ${update.currentVersion}).
+
+지금 설치하면 앱이 재시작되고 열린 터미널이 모두 종료됩니다.`,
+      { title: "업데이트", okLabel: "설치", cancelLabel: "나중에" },
+    );
+    if (!ok) return;
+    await update.downloadAndInstall();
+    await relaunch();
+  } catch (e) {
+    console.warn("update check failed", e);
+  }
 }
 
 async function refreshUsage() {
@@ -2170,6 +2191,7 @@ if (!IS_TERMINAL_WINDOW) {
     // Load terminal module AFTER the DOM is ready so it can mount into
     // #tabs / #terminals created by renderShell.
     await import("./terminal");
+    void checkForUpdate();
     // Kick off usage: initial snapshot + live listener.
     void refreshUsage();
     listen<UsageReport>("usage-update", (event) => {
