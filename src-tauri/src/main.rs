@@ -57,6 +57,9 @@ struct SessionInfo {
     custom_title: String,
     #[serde(default)]
     account_name: String,
+    // Started by `claude -p` / Agent SDK (entrypoint "sdk-*") rather than an interactive terminal.
+    #[serde(default)]
+    is_oneshot: bool,
 }
 
 unsafe impl Send for SessionInfo {}
@@ -415,6 +418,8 @@ struct AppConfig {
     claude_verbose: Option<bool>,
     #[serde(default)]
     skip_permissions: Option<bool>,
+    #[serde(default)]
+    show_oneshot: Option<bool>,
 }
 
 fn get_config_dir() -> Result<PathBuf, String> {
@@ -523,6 +528,20 @@ fn extract_first_prompt_from_jsonl(path: &Path) -> Option<String> {
     None
 }
 
+// `claude -p` and the Agent SDK write entrypoint "sdk-cli" / "sdk-ts" / "sdk-py";
+// interactive sessions write "cli" (or an IDE/desktop entrypoint). Old files have none.
+fn is_oneshot_session(path: &Path) -> bool {
+    let file = match fs::File::open(path) { Ok(f) => f, Err(_) => return false };
+    let reader = BufReader::with_capacity(16384, file);
+    for line in reader.lines().take(30) {
+        let line = match line { Ok(l) => l, Err(_) => return false };
+        if let Some(i) = line.find("\"entrypoint\":\"") {
+            return line[i + 14..].starts_with("sdk-");
+        }
+    }
+    false
+}
+
 fn estimate_message_count(path: &Path) -> u32 {
     fs::metadata(path).map(|m| std::cmp::max(1, (m.len() / 2048) as u32)).unwrap_or(1)
 }
@@ -579,14 +598,15 @@ fn scan_project(project_dir: &Path, folder_name: &str, account_name: &str, label
         let session_id = file_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
         let labels_vec = labels.labels.get(&session_id).cloned().unwrap_or_default();
         let custom_title = titles.get(&session_id).cloned().unwrap_or_default();
+        let is_oneshot = is_oneshot_session(&file_path);
         if let Some(idx) = indexed.get(&session_id) {
-            sessions.push(SessionInfo { session_id, first_prompt: idx.first_prompt.clone().unwrap_or_default(), summary: idx.summary.clone().unwrap_or_default(), message_count: idx.message_count, created: idx.created.clone().unwrap_or_default(), modified: idx.modified.clone().unwrap_or_default(), git_branch: idx.git_branch.clone().unwrap_or_default(), project_path: project_path.clone(), project_folder: folder_name.to_string(), labels: labels_vec, custom_title, account_name: account_name.to_string() });
+            sessions.push(SessionInfo { session_id, first_prompt: idx.first_prompt.clone().unwrap_or_default(), summary: idx.summary.clone().unwrap_or_default(), message_count: idx.message_count, created: idx.created.clone().unwrap_or_default(), modified: idx.modified.clone().unwrap_or_default(), git_branch: idx.git_branch.clone().unwrap_or_default(), project_path: project_path.clone(), project_folder: folder_name.to_string(), labels: labels_vec, custom_title, account_name: account_name.to_string(), is_oneshot });
         } else {
             let first_prompt = extract_first_prompt_from_jsonl(&file_path).unwrap_or_default();
             let msg_count = estimate_message_count(&file_path);
             let modified = file_time_to_rfc3339(&file_path, true);
             let created = file_time_to_rfc3339(&file_path, false);
-            sessions.push(SessionInfo { session_id, first_prompt, summary: String::new(), message_count: msg_count, created, modified, git_branch: String::new(), project_path: project_path.clone(), project_folder: folder_name.to_string(), labels: labels_vec, custom_title, account_name: account_name.to_string() });
+            sessions.push(SessionInfo { session_id, first_prompt, summary: String::new(), message_count: msg_count, created, modified, git_branch: String::new(), project_path: project_path.clone(), project_folder: folder_name.to_string(), labels: labels_vec, custom_title, account_name: account_name.to_string(), is_oneshot });
         }
     }
     sessions
@@ -1261,6 +1281,16 @@ fn get_skip_permissions() -> bool { load_config().skip_permissions.unwrap_or(tru
 fn set_skip_permissions(value: bool) -> Result<(), String> {
     let mut cfg = load_config();
     cfg.skip_permissions = Some(value);
+    save_config(&cfg)
+}
+
+#[tauri::command]
+fn get_show_oneshot() -> bool { load_config().show_oneshot.unwrap_or(false) }
+
+#[tauri::command]
+fn set_show_oneshot(value: bool) -> Result<(), String> {
+    let mut cfg = load_config();
+    cfg.show_oneshot = Some(value);
     save_config(&cfg)
 }
 
@@ -2318,6 +2348,7 @@ fn main() {
             get_log_dir, set_log_dir, clear_logs,
             get_claude_verbose, set_claude_verbose,
             get_skip_permissions, set_skip_permissions,
+            get_show_oneshot, set_show_oneshot,
             open_path_in_os,
             get_metadata_paths, export_metadata_to, import_metadata_from,
             get_usage_report, get_session_usage, find_new_session_since, get_oauth_usage, get_cached_oauth_usage,
@@ -2352,6 +2383,25 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oneshot_detected_from_sdk_entrypoint() {
+        let dir = std::env::temp_dir().join(format!("scsm-oneshot-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| { let p = dir.join(name); fs::write(&p, body).unwrap(); p };
+        let head = "{\"type\":\"queue-operation\"}
+";
+        let sdk = write("sdk.jsonl", &format!("{head}{{\"type\":\"user\",\"entrypoint\":\"sdk-cli\"}}
+"));
+        let cli = write("cli.jsonl", &format!("{head}{{\"type\":\"user\",\"entrypoint\":\"cli\"}}
+"));
+        let old = write("old.jsonl", "{\"type\":\"user\"}
+");
+        assert!(is_oneshot_session(&sdk));
+        assert!(!is_oneshot_session(&cli));
+        assert!(!is_oneshot_session(&old));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     // Captured from the live endpoint on 2026-07-06 (Claude 5 era): the old
     // seven_day_sonnet field is null and scoped weekly moved into `limits`.

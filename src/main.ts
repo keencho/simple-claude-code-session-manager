@@ -60,6 +60,7 @@ interface SessionInfo {
   labels: string[];
   custom_title: string;
   account_name?: string;
+  is_oneshot?: boolean;
 }
 
 interface Account {
@@ -186,6 +187,12 @@ let filterSessionLabel: string | null = null;
 let filtersPanelOpen = false;
 let globalSkipPermissions = true;
 let globalNewWindow = false;
+let showOneshot = false;
+
+// `claude -p` / SDK sessions are hidden unless the toggle is on.
+function visibleSessions(): SessionInfo[] {
+  return showOneshot ? allSessions : allSessions.filter((s) => !s.is_oneshot);
+}
 
 // --- Sidebar layout prefs (localStorage) ---
 
@@ -609,7 +616,7 @@ function getProjectDisplayName(folder: string, path: string): string {
 
 function getProjects(): { folder: string; path: string }[] {
   const map = new Map<string, string>();
-  for (const s of allSessions) {
+  for (const s of visibleSessions()) {
     if (!map.has(s.project_folder)) map.set(s.project_folder, s.project_path);
   }
   return Array.from(map.entries())
@@ -635,7 +642,7 @@ function getFoldersForProjectLabel(label: string): Set<string> {
 
 function getFilteredSessions(): SessionInfo[] {
   const q = searchQuery.toLowerCase();
-  return allSessions.filter((s) => {
+  return visibleSessions().filter((s) => {
     const projLabel = getProjectLabel(s.project_folder).toLowerCase();
     const matchesSearch =
       !q ||
@@ -665,7 +672,7 @@ function getFilteredSessions(): SessionInfo[] {
 
 function getProjectLabelGroups(): { label: string; projectCount: number; sessionCount: number }[] {
   const map = new Map<string, { folders: Set<string>; sessionCount: number }>();
-  for (const s of allSessions) {
+  for (const s of visibleSessions()) {
     const label = getProjectLabel(s.project_folder);
     if (!label) continue;
     let entry = map.get(label);
@@ -686,7 +693,7 @@ function getProjectLabelGroups(): { label: string; projectCount: number; session
 }
 
 function getSessionLabelsForChips(): { name: string; count: number }[] {
-  const filtered = allSessions.filter((s) => {
+  const filtered = visibleSessions().filter((s) => {
     if (filterProjectLabel !== null) {
       const folders = getFoldersForProjectLabel(filterProjectLabel);
       return folders.has(s.project_folder);
@@ -1904,6 +1911,11 @@ function renderShell() {
               <span class="toggle-mini-track"><span class="toggle-mini-thumb"></span></span>
               <span class="toggle-label-text">권한 무시</span>
             </label>
+            <label class="toggle-global-nw" title="claude -p / SDK 로 생긴 일회성 세션 표시">
+              <input type="checkbox" id="global-oneshot" ${showOneshot ? "checked" : ""} />
+              <span class="toggle-mini-track"><span class="toggle-mini-thumb"></span></span>
+              <span class="toggle-label-text">일회성</span>
+            </label>
             <label class="toggle-global-nw" title="기본적으로 새 창에서 열기">
               <input type="checkbox" id="global-newwin" />
               <span class="toggle-mini-track"><span class="toggle-mini-thumb"></span></span>
@@ -1964,6 +1976,12 @@ function renderShell() {
   (document.getElementById("global-skip") as HTMLInputElement).addEventListener("change", async (e) => {
     globalSkipPermissions = (e.target as HTMLInputElement).checked;
     try { await invoke("set_skip_permissions", { value: globalSkipPermissions }); } catch {}
+  });
+  (document.getElementById("global-oneshot") as HTMLInputElement).addEventListener("change", async (e) => {
+    showOneshot = (e.target as HTMLInputElement).checked;
+    renderTree();
+    if (filtersPanelOpen) renderChips();
+    try { await invoke("set_show_oneshot", { value: showOneshot }); } catch {}
   });
   (document.getElementById("global-newwin") as HTMLInputElement).addEventListener("change", (e) => {
     globalNewWindow = (e.target as HTMLInputElement).checked;
@@ -2132,6 +2150,7 @@ if (!IS_TERMINAL_WINDOW) {
     } catch {}
     // Load saved global toggles before rendering so the checkbox reflects state.
     try { globalSkipPermissions = await invoke<boolean>("get_skip_permissions"); } catch {}
+    try { showOneshot = await invoke<boolean>("get_show_oneshot"); } catch {}
     try {
       const favs = await invoke<string[]>("get_favorite_sessions");
       favoriteSessions = new Set(favs);
