@@ -779,6 +779,8 @@ async function addTab(payload: AddTabPayload) {
       rows: pane.term.rows || 24,
       cols: pane.term.cols || 80,
       env: payload.env ?? null,
+      title: baseTitle,
+      accountName: payload.account_name ?? null,
     });
     pane.term.focus();
     updateWindowTitle();
@@ -876,6 +878,8 @@ async function splitTab(tab: Tab, from: Pane, sshArgs: string[], baseTitle: stri
       rows: pane.term.rows || 24,
       cols: pane.term.cols || 80,
       env: from.env ?? null,
+      title: baseTitle,
+      accountName: from.accountName ?? null,
     });
     pane.term.focus();
     updateWindowTitle();
@@ -1530,6 +1534,33 @@ listen<AddTabPayload>("add-tab", (event) => {
   void addTab(event.payload);
 }, scoped);
 
+// ---------- Restore sessions open at last exit ----------
+interface OpenSessionEntry {
+  session_id: string;
+  cwd: string | null;
+  args: string[];
+  env: Record<string, string>;
+  title: string;
+  account_name: string | null;
+}
+
+if (myLabel === "main") {
+  void (async () => {
+    let entries: OpenSessionEntry[] = [];
+    try { entries = await invoke<OpenSessionEntry[]>("take_restore_sessions"); } catch {}
+    for (const e of entries) {
+      await addTab({
+        terminal_id: uid(),
+        title: e.title || "claude",
+        ssh_args: [...e.args, "--resume", e.session_id],
+        cwd: e.cwd,
+        env: e.env,
+        account_name: e.account_name,
+      });
+    }
+  })();
+}
+
 // ---------- Context menus ----------
 interface MenuItem { label: string; action: () => void; danger?: boolean; }
 
@@ -2033,7 +2064,9 @@ getCurrentWindow().onCloseRequested(async (event) => {
   for (const tab of tabs.values()) for (const p of tab.panes) ids.push(p.id);
   tabs.clear();
   const hideOverlay = showClosingOverlay();
-  try { await invoke("pty_kill_many", { terminalIds: ids }); } catch {}
+  // Closing the main window quits the app: keep its sessions for restore.
+  // Closing a secondary window is a deliberate close, so forget them.
+  try { await invoke("pty_kill_many", { terminalIds: ids, forget: myLabel !== "main" }); } catch {}
   hideOverlay();
   await getCurrentWindow().destroy();
 });

@@ -2938,3 +2938,10 @@ body.statusbar-hidden .terminal-status-bar { display: none; }
   color: var(--fg-dim);
   font-family: monospace;
 }
+
+.settings-version {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-tertiary);
+  margin-left: 6px;
+}

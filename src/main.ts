@@ -5,6 +5,7 @@ import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
 import {
   THEMES,
   THEME_GROUPS,
@@ -190,6 +191,7 @@ let filtersPanelOpen = false;
 let globalSkipPermissions = true;
 let globalNewWindow = false;
 let showOneshot = false;
+let appVersion = "";
 
 // `claude -p` / SDK sessions are hidden unless the toggle is on.
 function visibleSessions(): SessionInfo[] {
@@ -1237,7 +1239,7 @@ function renderStats() {
   const el = document.getElementById("stats");
   if (!el) return;
   const filtered = getFilteredSessions();
-  el.textContent = `전체 ${allSessions.length} · 표시 ${filtered.length}`;
+  el.textContent = `전체 ${allSessions.length} · 표시 ${filtered.length}` + (appVersion ? ` · v${appVersion}` : "");
 }
 
 function renderChips() {
@@ -1404,6 +1406,7 @@ async function openSettings() {
   const currentThemeName: string = (await invoke<string | null>("get_terminal_theme")) ?? DEFAULT_THEME;
   const currentLogDir: string = await invoke<string>("get_log_dir");
   const currentVerbose: boolean = await invoke<boolean>("get_claude_verbose");
+  const currentRestore: boolean = await invoke<boolean>("get_restore_sessions");
   const metaPaths = await invoke<{ claude_dir: string; session_labels: string; project_labels: string; session_titles: string }>("get_metadata_paths");
 
   const overlay = document.createElement("div");
@@ -1448,13 +1451,14 @@ async function openSettings() {
   overlay.innerHTML = `
     <div class="modal modal-settings">
       <header class="settings-header">
-        <div class="settings-title">설정</div>
+        <div class="settings-title">설정${appVersion ? ` <span class="settings-version">v${appVersion}</span>` : ""}</div>
         <button class="settings-close" title="닫기">${ICONS.close}</button>
       </header>
       <div class="settings-body">
         <aside class="settings-nav">
           <button class="settings-nav-item active" data-section="usage">사용량</button>
           <button class="settings-nav-item" data-section="accounts">계정</button>
+          <button class="settings-nav-item" data-section="session">세션</button>
           <button class="settings-nav-item" data-section="theme">테마</button>
           <button class="settings-nav-item" data-section="layout">외관</button>
           <button class="settings-nav-item" data-section="log">로그</button>
@@ -1485,6 +1489,15 @@ async function openSettings() {
             <div class="settings-btn-row">
               <button class="btn-secondary-sm" id="add-label-mapping-btn">${ICONS.plus}<span>매핑 추가</span></button>
             </div>
+          </section>
+          <section class="settings-panel" data-section="session" hidden>
+            <div class="settings-panel-title">세션</div>
+            <label class="settings-toggle-row">
+              <input type="checkbox" id="settings-restore-sessions" ${currentRestore ? "checked" : ""}>
+              <span class="toggle-mini-track"><span class="toggle-mini-thumb"></span></span>
+              <span class="settings-toggle-text">시작할 때 마지막에 열려 있던 세션 다시 열기</span>
+            </label>
+            <div class="settings-panel-hint">앱 종료, 비정상 종료, Windows 업데이트 재부팅 후에도 복원됩니다. 직접 닫은 탭과 따로 띄운 창에서 닫은 세션은 제외됩니다. 메시지를 한 번도 보내지 않은 새 세션은 복원되지 않습니다.</div>
           </section>
           <section class="settings-panel" data-section="theme" hidden>
             <div class="settings-panel-title">터미널 테마</div>
@@ -1612,6 +1625,11 @@ async function openSettings() {
       const n = await invoke<number>("clear_logs");
       await customAlert(`${n}개 로그 파일을 삭제했습니다.`);
     } catch (err) { await customAlert("로그 삭제 실패: " + err); }
+  });
+  overlay.querySelector("#settings-restore-sessions")!.addEventListener("change", async (e) => {
+    const checked = (e.target as HTMLInputElement).checked;
+    try { await invoke("set_restore_sessions", { value: checked }); }
+    catch (err) { await customAlert("설정 실패: " + err); }
   });
   overlay.querySelector("#settings-claude-verbose")!.addEventListener("change", async (e) => {
     const checked = (e.target as HTMLInputElement).checked;
@@ -2172,6 +2190,7 @@ if (!IS_TERMINAL_WINDOW) {
     // Load saved global toggles before rendering so the checkbox reflects state.
     try { globalSkipPermissions = await invoke<boolean>("get_skip_permissions"); } catch {}
     try { showOneshot = await invoke<boolean>("get_show_oneshot"); } catch {}
+    try { appVersion = await getVersion(); } catch {}
     try {
       const favs = await invoke<string[]>("get_favorite_sessions");
       favoriteSessions = new Set(favs);

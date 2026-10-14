@@ -395,6 +395,11 @@ struct MergeTabPayload {
 struct AppState {
     ptys: Mutex<HashMap<String, Arc<PtyInstance>>>,
     pending_tabs: Mutex<HashMap<String, AddTabPayload>>,
+    // Claude sessions open right now, persisted on every change so a crash or a
+    // forced reboot still leaves the list on disk.
+    open_sessions: Mutex<Vec<OpenSessionEntry>>,
+    // What was open when the app last ran; handed out once to the main window.
+    restore_pending: Mutex<Option<Vec<OpenSessionEntry>>>,
     #[allow(dead_code)]
     runtime: tokio::runtime::Runtime,
 }
@@ -420,6 +425,8 @@ struct AppConfig {
     skip_permissions: Option<bool>,
     #[serde(default)]
     show_oneshot: Option<bool>,
+    #[serde(default)]
+    restore_sessions: Option<bool>,
 }
 
 fn get_config_dir() -> Result<PathBuf, String> {
@@ -779,6 +786,80 @@ fn delete_project_sessions(project_folder: String, account_name: Option<String>)
     Ok(deleted)
 }
 
+// --- Session restore ---
+//
+// Every claude PTY is recorded with the session id it runs. New sessions get
+// an id up front via --session-id, so nothing has to be discovered later. An
+// entry is dropped only when the user closes its tab/pane or a secondary
+// window; quitting from the main window, a crash, or a Windows Update reboot
+// all leave it on disk for the next launch.
+
+#[derive(Serialize, Deserialize, Clone)]
+struct OpenSessionEntry {
+    terminal_id: String,
+    session_id: String,
+    cwd: Option<String>,
+    // claude args minus --resume / --session-id
+    args: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    account_name: Option<String>,
+}
+
+fn open_sessions_path() -> Result<PathBuf, String> { Ok(get_config_dir()?.join("open-sessions.json")) }
+
+fn load_open_sessions() -> Vec<OpenSessionEntry> {
+    open_sessions_path().ok()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_open_sessions(list: &[OpenSessionEntry]) {
+    if let (Ok(p), Ok(json)) = (open_sessions_path(), serde_json::to_string_pretty(list)) {
+        let _ = fs::write(p, json);
+    }
+}
+
+// Splits `--resume X` / `--session-id X` out of the args. Returns the session id
+// (if any) and the remaining args.
+fn split_session_args(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut sid = None;
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--resume" || a == "--session-id" {
+            if let Some(v) = it.next() { sid = Some(v.clone()); }
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    (sid, rest)
+}
+
+fn session_jsonl_exists(session_id: &str, env: &HashMap<String, String>) -> bool {
+    let projects = match env.get("CLAUDE_CONFIG_DIR") {
+        Some(dir) => PathBuf::from(dir).join("projects"),
+        None => match get_claude_projects_dir() { Some(p) => p, None => return false },
+    };
+    let file = format!("{}.jsonl", session_id);
+    fs::read_dir(projects).into_iter().flatten().flatten().any(|e| e.path().join(&file).is_file())
+}
+
+#[tauri::command]
+fn take_restore_sessions(state: State<AppState>) -> Vec<OpenSessionEntry> {
+    let prev = state.restore_pending.lock().unwrap().take().unwrap_or_default();
+    if !load_config().restore_sessions.unwrap_or(true) { return Vec::new(); }
+    let mut seen = std::collections::HashSet::new();
+    prev.into_iter()
+        // A session that never got a message has no jsonl and cannot be resumed.
+        .filter(|e| seen.insert(e.session_id.clone()) && session_jsonl_exists(&e.session_id, &e.env))
+        .collect()
+}
+
 // --- Tauri Commands: terminal / PTY ---
 
 #[tauri::command]
@@ -895,9 +976,31 @@ fn pty_spawn(
     rows: u16,
     cols: u16,
     env: Option<HashMap<String, String>>,
+    title: Option<String>,
+    account_name: Option<String>,
     app: AppHandle,
     state: State<AppState>,
 ) -> Result<(), String> {
+    let (sid, base_args) = split_session_args(&ssh_args);
+    let mut ssh_args = ssh_args;
+    let session_id = match sid {
+        Some(s) => s,
+        None => {
+            let s = Uuid::new_v4().to_string();
+            ssh_args.push("--session-id".to_string());
+            ssh_args.push(s.clone());
+            s
+        }
+    };
+    let entry = OpenSessionEntry {
+        terminal_id: terminal_id.clone(),
+        session_id,
+        cwd: cwd.clone(),
+        args: base_args,
+        env: env.clone().unwrap_or_default(),
+        title: title.unwrap_or_default(),
+        account_name,
+    };
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| format!("openpty failed: {}", e))?;
     // On Windows, `claude` is a Node.js shim (.cmd file). CreateProcessW
@@ -939,6 +1042,11 @@ fn pty_spawn(
     let writer = pair.master.take_writer().map_err(|e| format!("take writer failed: {}", e))?;
     let instance = Arc::new(PtyInstance { master: Mutex::new(pair.master), writer: Mutex::new(writer), child: Mutex::new(child), _job: job });
     state.ptys.lock().unwrap().insert(terminal_id.clone(), instance);
+    {
+        let mut open = state.open_sessions.lock().unwrap();
+        open.push(entry);
+        save_open_sessions(&open);
+    }
     // When claude_verbose is on, tee PTY output to a timestamped log file.
     let verbose = load_config().claude_verbose.unwrap_or(false);
     let mut log_file: Option<File> = None;
@@ -1057,7 +1165,12 @@ async fn kill_terminals(ids: Vec<String>, state: &AppState) {
 }
 
 #[tauri::command]
-async fn pty_kill_many(terminal_ids: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
+async fn pty_kill_many(terminal_ids: Vec<String>, forget: Option<bool>, state: State<'_, AppState>) -> Result<(), String> {
+    if forget.unwrap_or(true) {
+        let mut open = state.open_sessions.lock().unwrap();
+        open.retain(|e| !terminal_ids.contains(&e.terminal_id));
+        save_open_sessions(&open);
+    }
     kill_terminals(terminal_ids, &state).await;
     Ok(())
 }
@@ -1281,6 +1394,16 @@ fn get_skip_permissions() -> bool { load_config().skip_permissions.unwrap_or(tru
 fn set_skip_permissions(value: bool) -> Result<(), String> {
     let mut cfg = load_config();
     cfg.skip_permissions = Some(value);
+    save_config(&cfg)
+}
+
+#[tauri::command]
+fn get_restore_sessions() -> bool { load_config().restore_sessions.unwrap_or(true) }
+
+#[tauri::command]
+fn set_restore_sessions(value: bool) -> Result<(), String> {
+    let mut cfg = load_config();
+    cfg.restore_sessions = Some(value);
     save_config(&cfg)
 }
 
@@ -2248,6 +2371,13 @@ fn main() {
         .manage(AppState {
             ptys: Mutex::new(HashMap::new()),
             pending_tabs: Mutex::new(HashMap::new()),
+            open_sessions: Mutex::new(Vec::new()),
+            restore_pending: Mutex::new(Some({
+                // Take last run's list and start this run from an empty one.
+                let prev = load_open_sessions();
+                save_open_sessions(&[]);
+                prev
+            })),
             runtime,
         })
         .manage(usage_state.clone())
@@ -2351,6 +2481,7 @@ fn main() {
             get_claude_verbose, set_claude_verbose,
             get_skip_permissions, set_skip_permissions,
             get_show_oneshot, set_show_oneshot,
+            get_restore_sessions, set_restore_sessions, take_restore_sessions,
             open_path_in_os,
             get_metadata_paths, export_metadata_to, import_metadata_from,
             get_usage_report, get_session_usage, find_new_session_since, get_oauth_usage, get_cached_oauth_usage,
@@ -2385,6 +2516,31 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_session_args_extracts_id_and_keeps_the_rest() {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (sid, rest) = split_session_args(&v(&["--resume", "abc", "--model", "opus", "--dangerously-skip-permissions"]));
+        assert_eq!(sid.as_deref(), Some("abc"));
+        assert_eq!(rest, v(&["--model", "opus", "--dangerously-skip-permissions"]));
+        let (sid, rest) = split_session_args(&v(&["--session-id", "xyz"]));
+        assert_eq!(sid.as_deref(), Some("xyz"));
+        assert!(rest.is_empty());
+        assert_eq!(split_session_args(&v(&["--model", "opus"])).0, None);
+    }
+
+    #[test]
+    fn restore_skips_sessions_without_a_jsonl() {
+        let root = std::env::temp_dir().join(format!("scsm-restore-{}", std::process::id()));
+        let proj = root.join("projects").join("D--work");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("used.jsonl"), "{}
+").unwrap();
+        let env: HashMap<String, String> = [("CLAUDE_CONFIG_DIR".to_string(), root.to_string_lossy().to_string())].into();
+        assert!(session_jsonl_exists("used", &env));
+        assert!(!session_jsonl_exists("never-messaged", &env));
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn oneshot_detected_from_sdk_entrypoint() {
