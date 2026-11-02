@@ -622,6 +622,11 @@ function createPane(init: { id: string; baseTitle: string; title: string; sshArg
     exited: false,
   };
 
+  // 드래그 선택 즉시 복사 — 이 페인에서 시작한 좌클릭 드래그만 대상 (아래 Clipboard 참고)
+  xtermEl.addEventListener("mousedown", (e) => {
+    if (e.button === 0) selectingPane = pane;
+  });
+
   // Focus on click anywhere in pane (resolve current tab dynamically)
   paneEl.addEventListener("mousedown", (e) => {
     // find bar 안을 클릭한 경우엔 터미널로 포커스를 되돌리면 안 된다.
@@ -1096,6 +1101,19 @@ document.addEventListener("wheel", (e) => {
 }, { capture: true, passive: false });
 
 // ---------- Clipboard ----------
+// 선택 즉시 복사 (simple-ssh-client 와 같은 방식).
+// onSelectionChange 는 드래그 중 매 프레임 터지므로 쓰지 않고, 페인에서 시작한
+// 드래그의 mouseup 만 본다. 드래그가 페인 밖에서 끝날 수 있어 up 은 document 에서 받는다.
+// 더블클릭(단어 선택)도 mousedown→mouseup 이라 같이 처리된다.
+let selectingPane: Pane | null = null;
+document.addEventListener("mouseup", () => {
+  const p = selectingPane;
+  selectingPane = null;
+  if (!p || !p.term.hasSelection()) return;
+  const sel = p.term.getSelection();
+  if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+});
+
 async function copyActiveSelection(): Promise<boolean> {
   const ap = getActivePane();
   if (!ap) return false;
