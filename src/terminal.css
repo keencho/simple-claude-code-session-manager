@@ -613,3 +613,36 @@ body.dragging-divider .pane-divider::before {
   background: color-mix(in srgb, var(--danger) 22%, transparent);
   color: var(--danger);
 }
+
+/* ---------- 복사 알림 토스트 ---------- */
+/* 터미널 위에 겹쳐 뜬다. 클릭은 통과시켜야 터미널 조작을 막지 않는다. */
+.copy-toast {
+  position: fixed;
+  right: 18px;
+  bottom: 40px;
+  z-index: 1000;
+  padding: 6px 12px;
+  border: 1px solid var(--bg-4);
+  border-radius: 6px;
+  background: var(--bg-3);
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+}
+.copy-toast.show {
+  opacity: 1;
+  visibility: visible;
+  animation: copy-toast-in 0.14s ease-out;
+}
+@keyframes copy-toast-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .copy-toast.show { animation: none; }
+}

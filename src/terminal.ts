@@ -1101,6 +1101,38 @@ document.addEventListener("wheel", (e) => {
 }, { capture: true, passive: false });
 
 // ---------- Clipboard ----------
+// 복사 알림 토스트 (simple-ssh-client 와 같은 모양). 연속 복사 시 마지막 것만 보인다.
+// 한글/이모지는 UTF-16 길이와 보이는 글자 수가 달라서 Array.from 으로 센다.
+let toastEl: HTMLDivElement | null = null;
+let toastTimer: number | undefined;
+function showCopiedToast(text: string) {
+  const chars = Array.from(text).length;
+  const lines = text.split("\n").length;
+  if (!toastEl) {
+    toastEl = document.createElement("div");
+    toastEl.className = "copy-toast";
+    toastEl.setAttribute("aria-live", "polite");
+    document.body.appendChild(toastEl);
+  }
+  toastEl.textContent = lines > 1 ? `${lines}줄 · ${chars}자 복사됨` : `${chars}자 복사됨`;
+  // 애니메이션 재시작
+  toastEl.classList.remove("show");
+  void toastEl.offsetWidth;
+  toastEl.classList.add("show");
+  if (toastTimer !== undefined) clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => toastEl?.classList.remove("show"), 1400);
+}
+
+async function writeClipboard(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    showCopiedToast(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // 선택 즉시 복사 (simple-ssh-client 와 같은 방식).
 // onSelectionChange 는 드래그 중 매 프레임 터지므로 쓰지 않고, 페인에서 시작한
 // 드래그의 mouseup 만 본다. 드래그가 페인 밖에서 끝날 수 있어 up 은 document 에서 받는다.
@@ -1111,7 +1143,7 @@ document.addEventListener("mouseup", () => {
   selectingPane = null;
   if (!p || !p.term.hasSelection()) return;
   const sel = p.term.getSelection();
-  if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+  if (sel) void writeClipboard(sel);
 });
 
 async function copyActiveSelection(): Promise<boolean> {
@@ -1119,12 +1151,7 @@ async function copyActiveSelection(): Promise<boolean> {
   if (!ap) return false;
   const sel = ap.pane.term.getSelection();
   if (!sel) return false;
-  try {
-    await navigator.clipboard.writeText(sel);
-    return true;
-  } catch {
-    return false;
-  }
+  return writeClipboard(sel);
 }
 
 function sendTextToActivePty(text: string) {
