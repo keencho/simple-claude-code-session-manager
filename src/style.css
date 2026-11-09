@@ -2946,18 +2946,13 @@ body.statusbar-hidden .terminal-status-bar { display: none; }
   margin-left: 6px;
 }
 
-/* 탭으로 열려 있는 세션: 제목 앞 점. 지금 보고 있는 탭의 세션: 행 강조 */
-.session-open-dot { display: none; }
-.tree-session.is-open .session-open-dot {
-  display: inline-block;
-  width: 6px;
-  height: 6px;
-  margin-right: 6px;
-  border-radius: 50%;
-  background: var(--accent);
-  vertical-align: middle;
+/* 탭으로 열려 있는 세션: 제목 앞 >_ 아이콘. 지금 보고 있는 탭의 세션: hover보다 한 단계 진한 배경 */
+.session-open-icon { display: none; }
+.tree-session.is-open .session-open-icon {
+  display: inline-flex;
+  flex-shrink: 0;
+  color: var(--accent);
 }
-.tree-session.is-active {
-  background: var(--bg-hover);
-  box-shadow: inset 2px 0 0 var(--accent);
-}
+.session-open-icon svg { width: 12px; height: 12px; }
+.tree-session.is-active,
+.tree-session.is-active:hover { background: var(--bg-4, var(--bg-hover)); }

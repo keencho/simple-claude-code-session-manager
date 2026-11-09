@@ -202,14 +202,19 @@ function titleWithName(baseTitle: string, name: string): string {
   return name ? `${project}:${name}` : project;
 }
 
-function setPaneTitle(tab: Tab, pane: Pane, base: string) {
+function setPaneTitle(tab: Tab, pane: Pane, base: string, kind: "manual" | "auto" | "none") {
   pane.baseTitle = base;
   // Free the old title first so chooseTitle doesn't count this pane against itself.
   pane.title = "";
   pane.title = chooseTitle(base);
-  (pane.headerEl.querySelector(".pane-header-title") as HTMLElement).textContent = pane.title;
+  const tip = kind === "manual" ? "직접 붙인 이름" : kind === "auto" ? "자동 제목 (Claude가 붙임)" : "";
+  const headerTitle = pane.headerEl.querySelector(".pane-header-title") as HTMLElement;
+  headerTitle.textContent = pane.title;
+  headerTitle.title = tip;
   if (tab.panes[0] === pane) {
-    (tab.tabBtnEl.querySelector(".tab-title") as HTMLElement).textContent = pane.title;
+    const tabTitle = tab.tabBtnEl.querySelector(".tab-title") as HTMLElement;
+    tabTitle.textContent = pane.title;
+    tabTitle.title = tip;
   }
 }
 
@@ -1650,7 +1655,19 @@ listen<{ session_id: string; title: string }>("session-title-changed", (ev) => {
   const { session_id, title } = ev.payload;
   for (const tab of tabs.values()) {
     for (const p of tab.panes) {
-      if (p.sessionId === session_id) setPaneTitle(tab, p, titleWithName(p.baseTitle, title));
+      if (p.sessionId === session_id) setPaneTitle(tab, p, titleWithName(p.baseTitle, title), title ? "manual" : "none");
+    }
+  }
+  updateWindowTitle();
+});
+
+// Unnamed sessions follow Claude's own title (the main window only sends these
+// for sessions without a user-given name).
+listen<{ session_id: string; title: string }>("session-auto-title", (ev) => {
+  const { session_id, title } = ev.payload;
+  for (const tab of tabs.values()) {
+    for (const p of tab.panes) {
+      if (p.sessionId === session_id) setPaneTitle(tab, p, titleWithName(p.baseTitle, title), "auto");
     }
   }
   updateWindowTitle();

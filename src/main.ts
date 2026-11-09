@@ -204,15 +204,46 @@ async function refreshOpenSessions() {
   let live: LiveSession[] = [];
   try { live = await invoke<LiveSession[]>("get_open_sessions"); } catch { return; }
   openSessionIds = new Set(live.map((l) => l.session_id));
+  // A tab may have just opened: resend names so it gets the title + tooltip.
+  lastAutoTitle.clear();
+  for (const l of live) {
+    const s = allSessions.find((x) => x.session_id === l.session_id);
+    if (s && s.custom_title) void emit("session-title-changed", { session_id: s.session_id, title: s.custom_title });
+  }
   const known = new Set(allSessions.map((s) => s.session_id));
   // A new session shows up in the list once its first message creates the
   // jsonl; keep checking until every open session is listed.
   if (live.some((l) => l.has_jsonl && !known.has(l.session_id))) await loadSessions();
   else renderTree();
+  void syncAutoTitles();
   window.clearTimeout(openSessionsRecheck);
   if (live.some((l) => !l.has_jsonl)) {
     openSessionsRecheck = window.setTimeout(() => void refreshOpenSessions(), 3000);
   }
+}
+
+// Tabs without a name of their own follow Claude's ai-title, which changes as
+// the conversation goes; check the open sessions periodically.
+const lastAutoTitle = new Map<string, string>();
+
+async function syncAutoTitles() {
+  const unnamed = [...openSessionIds].filter((id) => {
+    const s = allSessions.find((x) => x.session_id === id);
+    return !s || !s.custom_title;
+  });
+  if (unnamed.length === 0) return;
+  let titles: Record<string, string> = {};
+  try { titles = await invoke<Record<string, string>>("get_ai_titles", { sessionIds: unnamed }); } catch { return; }
+  let changed = false;
+  for (const [sid, title] of Object.entries(titles)) {
+    if (lastAutoTitle.get(sid) === title) continue;
+    lastAutoTitle.set(sid, title);
+    const s = allSessions.find((x) => x.session_id === sid);
+    if (s && s.custom_title) continue;
+    if (s && s.ai_title !== title) { s.ai_title = title; changed = true; }
+    await emit("session-auto-title", { session_id: sid, title });
+  }
+  if (changed) renderTree();
 }
 
 function markActiveSessionRow() {
@@ -1236,6 +1267,9 @@ async function deleteProjectSessions(folder: string, path: string) {
 
 function renderSessionRow(s: SessionInfo, showPathHint = false): string {
   const title = s.custom_title || s.ai_title || s.first_prompt?.trim() || "(내용 없음)";
+  const titleTip = s.custom_title
+    ? ` title="직접 붙인 이름"`
+    : s.ai_title ? ` title="자동 제목 (Claude가 붙임)"` : "";
   const labels = s.labels
     .slice(0, 3)
     .map((l) => `<span class="session-label">${escapeHtml(l)}</span>`)
@@ -1264,7 +1298,7 @@ function renderSessionRow(s: SessionInfo, showPathHint = false): string {
 
   return `
     <div class="tree-session ${isFav ? "is-favorite" : ""} ${openSessionIds.has(s.session_id) ? "is-open" : ""} ${activeSessionId === s.session_id ? "is-active" : ""}" data-session-id="${s.session_id}" data-project-folder="${escapeHtml(s.project_folder)}" data-project-path="${escapeHtml(s.project_path)}" data-account-name="${escapeHtml(s.account_name || "")}">
-      <div class="session-title">${favIcon}<span class="session-open-dot" title="열려 있음"></span>${escapeHtml(title)}</div>
+      <div class="session-title"${titleTip}>${favIcon}<span class="session-open-icon" title="터미널에서 열려 있음">${ICONS.terminal}</span>${escapeHtml(title)}</div>
       <div class="session-meta">
         ${pathHint}
         ${accountBadge}
@@ -2287,6 +2321,11 @@ if (!IS_TERMINAL_WINDOW) {
     });
     // Renamed from a tab: reflect it here (the session may not be listed yet).
     listen<{ session_id: string; title: string }>("session-title-changed", (event) => {
+      // Name cleared: let the tab fall back to the ai-title on the next sync.
+      if (!event.payload.title) {
+        lastAutoTitle.delete(event.payload.session_id);
+        window.setTimeout(() => void syncAutoTitles(), 300);
+      }
       const s = allSessions.find((x) => x.session_id === event.payload.session_id);
       if (!s) { void loadSessions(); return; }
       if (s.custom_title === event.payload.title) return;
@@ -2294,6 +2333,7 @@ if (!IS_TERMINAL_WINDOW) {
       renderTree();
     });
     void refreshOpenSessions();
+    window.setInterval(() => void syncAutoTitles(), 30000);
   })();
 }
 

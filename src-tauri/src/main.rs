@@ -1152,6 +1152,36 @@ fn get_open_sessions(state: State<AppState>) -> Vec<LiveSession> {
         .collect()
 }
 
+// Latest Claude-generated title per session, for tabs that have no name of
+// their own. Looks across every account's projects dir.
+#[tauri::command]
+fn get_ai_titles(session_ids: Vec<String>) -> HashMap<String, String> {
+    let dirs: Vec<PathBuf> = all_projects_dirs()
+        .into_iter()
+        .flat_map(|(_, projects)| {
+            fs::read_dir(projects)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+        })
+        .collect();
+    let mut out = HashMap::new();
+    for sid in session_ids {
+        let file = format!("{}.jsonl", sid);
+        if let Some(t) = dirs
+            .iter()
+            .map(|d| d.join(&file))
+            .find(|p| p.is_file())
+            .and_then(|p| extract_ai_title(&p))
+        {
+            out.insert(sid, t);
+        }
+    }
+    out
+}
+
 // A pane that moved between windows only keeps its terminal id.
 #[tauri::command]
 fn session_id_for_terminal(terminal_id: String, state: State<AppState>) -> Option<String> {
@@ -3225,6 +3255,7 @@ fn main() {
             take_restore_sessions,
             get_open_sessions,
             session_id_for_terminal,
+            get_ai_titles,
             open_path_in_os,
             get_metadata_paths,
             export_metadata_to,
