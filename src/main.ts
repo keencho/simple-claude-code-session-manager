@@ -64,6 +64,7 @@ interface SessionInfo {
   custom_title: string;
   account_name?: string;
   is_oneshot?: boolean;
+  ai_title?: string;
 }
 
 interface Account {
@@ -192,6 +193,33 @@ let globalSkipPermissions = true;
 let globalNewWindow = false;
 let showOneshot = false;
 let appVersion = "";
+// Sessions running in some tab (any window), and the one in the focused tab.
+let openSessionIds = new Set<string>();
+let activeSessionId: string | null = null;
+let openSessionsRecheck: number | undefined;
+
+interface LiveSession { session_id: string; has_jsonl: boolean; }
+
+async function refreshOpenSessions() {
+  let live: LiveSession[] = [];
+  try { live = await invoke<LiveSession[]>("get_open_sessions"); } catch { return; }
+  openSessionIds = new Set(live.map((l) => l.session_id));
+  const known = new Set(allSessions.map((s) => s.session_id));
+  // A new session shows up in the list once its first message creates the
+  // jsonl; keep checking until every open session is listed.
+  if (live.some((l) => l.has_jsonl && !known.has(l.session_id))) await loadSessions();
+  else renderTree();
+  window.clearTimeout(openSessionsRecheck);
+  if (live.some((l) => !l.has_jsonl)) {
+    openSessionsRecheck = window.setTimeout(() => void refreshOpenSessions(), 3000);
+  }
+}
+
+function markActiveSessionRow() {
+  document.querySelectorAll(".tree-session.is-active").forEach((el) => el.classList.remove("is-active"));
+  if (!activeSessionId) return;
+  document.querySelector(`.tree-session[data-session-id="${CSS.escape(activeSessionId)}"]`)?.classList.add("is-active");
+}
 
 // `claude -p` / SDK sessions are hidden unless the toggle is on.
 function visibleSessions(): SessionInfo[] {
@@ -673,6 +701,7 @@ function getFilteredSessions(): SessionInfo[] {
       s.summary.toLowerCase().includes(q) ||
       s.labels.some((l) => l.toLowerCase().includes(q)) ||
       s.custom_title.toLowerCase().includes(q) ||
+      (s.ai_title || "").toLowerCase().includes(q) ||
       s.project_path.toLowerCase().includes(q) ||
       s.git_branch.toLowerCase().includes(q) ||
       projLabel.includes(q);
@@ -744,7 +773,7 @@ function buildTabTitle(sessionId: string | null, projectPath: string, projectFol
   if (sessionId) {
     const s = allSessions.find((x) => x.session_id === sessionId);
     if (s) {
-      const t = s.custom_title || s.labels[0] || s.first_prompt?.slice(0, 40) || "";
+      const t = s.custom_title || s.ai_title || s.labels[0] || s.first_prompt?.slice(0, 40) || "";
       if (projectName && t) return `${projectName}:${t}`;
       if (projectName) return projectName;
       if (t) return t;
@@ -943,6 +972,16 @@ async function resumeSession(
   model?: string,
   account?: string,
 ) {
+  // Plain resume of a session that's already open: jump to its tab.
+  if (!newWindow && model === undefined && account === undefined) {
+    try {
+      const live = await invoke<LiveSession[]>("get_open_sessions");
+      if (live.some((l) => l.session_id === sessionId)) {
+        await emit("focus-session", { session_id: sessionId });
+        return;
+      }
+    } catch {}
+  }
   const title = buildTabTitle(sessionId, projectPath, projectFolder);
   hideWelcome();
   // If caller didn't pin an account, resolve from explicit/label/info mappings
@@ -1059,6 +1098,8 @@ async function editSessionTitle(sessionId: string) {
     await invoke("set_session_title", { sessionId, title });
     if (s) s.custom_title = title;
     renderTree();
+    // Tabs running this session (any window) follow the new name.
+    await emit("session-title-changed", { session_id: sessionId, title });
   } catch (e) {
     await customAlert("제목 저장 실패: " + e);
   }
@@ -1194,7 +1235,7 @@ async function deleteProjectSessions(folder: string, path: string) {
 // --- Render ---
 
 function renderSessionRow(s: SessionInfo, showPathHint = false): string {
-  const title = s.custom_title || s.first_prompt?.trim() || "(내용 없음)";
+  const title = s.custom_title || s.ai_title || s.first_prompt?.trim() || "(내용 없음)";
   const labels = s.labels
     .slice(0, 3)
     .map((l) => `<span class="session-label">${escapeHtml(l)}</span>`)
@@ -1222,8 +1263,8 @@ function renderSessionRow(s: SessionInfo, showPathHint = false): string {
   }
 
   return `
-    <div class="tree-session ${isFav ? "is-favorite" : ""}" data-session-id="${s.session_id}" data-project-folder="${escapeHtml(s.project_folder)}" data-project-path="${escapeHtml(s.project_path)}" data-account-name="${escapeHtml(s.account_name || "")}">
-      <div class="session-title">${favIcon}${escapeHtml(title)}</div>
+    <div class="tree-session ${isFav ? "is-favorite" : ""} ${openSessionIds.has(s.session_id) ? "is-open" : ""} ${activeSessionId === s.session_id ? "is-active" : ""}" data-session-id="${s.session_id}" data-project-folder="${escapeHtml(s.project_folder)}" data-project-path="${escapeHtml(s.project_path)}" data-account-name="${escapeHtml(s.account_name || "")}">
+      <div class="session-title">${favIcon}<span class="session-open-dot" title="열려 있음"></span>${escapeHtml(title)}</div>
       <div class="session-meta">
         ${pathHint}
         ${accountBadge}
@@ -2239,6 +2280,20 @@ if (!IS_TERMINAL_WINDOW) {
     });
     // Cross-window toggle: a term-* window pressed Ctrl+Shift+B — flip + broadcast.
     listen("statusbar-toggle-request", () => setStatusBarVisible(!statusBarVisible));
+    listen("open-sessions-changed", () => void refreshOpenSessions());
+    listen<{ session_id: string | null }>("active-session-changed", (event) => {
+      activeSessionId = event.payload.session_id;
+      markActiveSessionRow();
+    });
+    // Renamed from a tab: reflect it here (the session may not be listed yet).
+    listen<{ session_id: string; title: string }>("session-title-changed", (event) => {
+      const s = allSessions.find((x) => x.session_id === event.payload.session_id);
+      if (!s) { void loadSessions(); return; }
+      if (s.custom_title === event.payload.title) return;
+      s.custom_title = event.payload.title;
+      renderTree();
+    });
+    void refreshOpenSessions();
   })();
 }
 

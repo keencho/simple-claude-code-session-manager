@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen, emit } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { Terminal } from "@xterm/xterm";
@@ -75,6 +75,9 @@ interface Pane {
   cwd: string | null;
   env?: Record<string, string>;
   accountName?: string | null;
+  // Claude session this pane runs. Known up front (the backend hands out ids
+  // for new sessions too), so title sync and "focus open tab" can key on it.
+  sessionId: string | null;
   fontSize: number;
   paneEl: HTMLElement;
   headerEl: HTMLElement;
@@ -187,6 +190,32 @@ function getActivePane(): { tab: Tab; pane: Pane } | null {
 }
 
 function stripSuffix(s: string): string { return s.replace(/ \(\d+\)$/, ""); }
+
+function sessionIdFromArgs(args: string[]): string | null {
+  const i = args.findIndex(a => a === "--resume" || a === "--session-id");
+  return i >= 0 && i + 1 < args.length ? args[i + 1] : null;
+}
+
+// Tab titles are "project:name" (or just "project" for an unnamed session).
+function titleWithName(baseTitle: string, name: string): string {
+  const project = baseTitle.split(":")[0];
+  return name ? `${project}:${name}` : project;
+}
+
+function setPaneTitle(tab: Tab, pane: Pane, base: string) {
+  pane.baseTitle = base;
+  // Free the old title first so chooseTitle doesn't count this pane against itself.
+  pane.title = "";
+  pane.title = chooseTitle(base);
+  (pane.headerEl.querySelector(".pane-header-title") as HTMLElement).textContent = pane.title;
+  if (tab.panes[0] === pane) {
+    (tab.tabBtnEl.querySelector(".tab-title") as HTMLElement).textContent = pane.title;
+  }
+}
+
+function announceActiveSession(pane: Pane | null) {
+  void emit("active-session-changed", { session_id: pane?.sessionId ?? null });
+}
 
 function chooseTitle(base: string): string {
   const taken = new Set<string>();
@@ -619,6 +648,7 @@ function createPane(init: { id: string; baseTitle: string; title: string; sshArg
     term, fit, serialize, search, webgl,
     env: init.env,
     accountName: init.accountName ?? null,
+    sessionId: sessionIdFromArgs(init.sshArgs),
     exited: false,
   };
 
@@ -757,13 +787,15 @@ async function addTab(payload: AddTabPayload) {
   applyFocusStyles(tab);
 
   // Track this window's active session for the status bar.
-  const _resumeIdx = pane.sshArgs.indexOf("--resume");
-  const _sid = _resumeIdx >= 0 && _resumeIdx + 1 < pane.sshArgs.length ? pane.sshArgs[_resumeIdx + 1] : null;
-  _localActiveSessionId = _sid;
-  _newSessionDiscoveryStart = _sid ? null : Date.now() - 5000;
+  _localActiveSessionId = pane.sessionId;
+  _newSessionDiscoveryStart = pane.sessionId ? null : Date.now() - 5000;
   void _refetchLocalSession();
 
   if (adopt) {
+    void invoke<string | null>("session_id_for_terminal", { terminalId: pane.id }).then((sid) => {
+      if (sid) pane.sessionId = sid;
+      if (activeTabId === tabId) announceActiveSession(pane);
+    }).catch(() => {});
     if (initialContent) pane.term.write(initialContent);
     const queued = pendingOutput.get(pane.id);
     if (queued) {
@@ -777,7 +809,7 @@ async function addTab(payload: AddTabPayload) {
   }
 
   try {
-    await invoke("pty_spawn", {
+    pane.sessionId = await invoke<string>("pty_spawn", {
       terminalId: pane.id,
       sshArgs: payload.ssh_args,
       cwd: payload.cwd ?? null,
@@ -787,6 +819,11 @@ async function addTab(payload: AddTabPayload) {
       title: baseTitle,
       accountName: payload.account_name ?? null,
     });
+    if (activeTabId === tabId) {
+      _localActiveSessionId = pane.sessionId;
+      _newSessionDiscoveryStart = null;
+      announceActiveSession(pane);
+    }
     pane.term.focus();
     updateWindowTitle();
   } catch (e) {
@@ -836,9 +873,9 @@ function setActiveTab(tabId: string) {
     });
     p.term.focus();
     // Track this window's own active session (per-window, not global).
-    const resumeIdx = p.sshArgs.indexOf("--resume");
-    const sid = resumeIdx >= 0 && resumeIdx + 1 < p.sshArgs.length ? p.sshArgs[resumeIdx + 1] : null;
+    const sid = p.sessionId;
     _localActiveSessionId = sid;
+    announceActiveSession(p);
     // For new (no-resume) sessions, we don't have an id yet. Remember open time
     // so we can discover the id once Claude writes the jsonl file.
     if (!sid) {
@@ -876,7 +913,7 @@ async function splitTab(tab: Tab, from: Pane, sshArgs: string[], baseTitle: stri
   applyFocusStyles(tab);
 
   try {
-    await invoke("pty_spawn", {
+    pane.sessionId = await invoke<string>("pty_spawn", {
       terminalId: newId,
       sshArgs,
       cwd: from.cwd,
@@ -1606,6 +1643,89 @@ if (myLabel === "main") {
   })();
 }
 
+// ---------- Session name sync / focus open session ----------
+// Renaming from the sidebar or from a tab broadcasts the same event, so every
+// window updates its tabs and the sidebar updates its row.
+listen<{ session_id: string; title: string }>("session-title-changed", (ev) => {
+  const { session_id, title } = ev.payload;
+  for (const tab of tabs.values()) {
+    for (const p of tab.panes) {
+      if (p.sessionId === session_id) setPaneTitle(tab, p, titleWithName(p.baseTitle, title));
+    }
+  }
+  updateWindowTitle();
+});
+
+listen<{ session_id: string }>("focus-session", async (ev) => {
+  for (const tab of tabs.values()) {
+    const pane = tab.panes.find(p => p.sessionId === ev.payload.session_id && !p.exited);
+    if (!pane) continue;
+    tab.focusedPaneId = pane.id;
+    setActiveTab(tab.id);
+    applyFocusStyles(tab);
+    pane.term.focus();
+    const win = getCurrentWindow();
+    try { await win.unminimize(); await win.show(); await win.setFocus(); } catch {}
+    return;
+  }
+});
+
+function promptText(message: string, defaultValue: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "dialog-overlay";
+    overlay.innerHTML = `
+      <div class="dialog-box">
+        <div class="dialog-message"></div>
+        <input class="dialog-input" type="text" />
+        <div class="dialog-footer">
+          <button class="dialog-btn dialog-btn-cancel">취소</button>
+          <button class="dialog-btn dialog-btn-ok">확인</button>
+        </div>
+      </div>`;
+    (overlay.querySelector(".dialog-message") as HTMLElement).textContent = message;
+    const input = overlay.querySelector(".dialog-input") as HTMLInputElement;
+    input.value = defaultValue;
+    document.body.appendChild(overlay);
+    const close = (v: string | null) => { overlay.remove(); resolve(v); };
+    overlay.querySelector(".dialog-btn-ok")!.addEventListener("click", () => close(input.value));
+    overlay.querySelector(".dialog-btn-cancel")!.addEventListener("click", () => close(null));
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(null); });
+    input.addEventListener("keydown", (e) => {
+      // 한글 조합 중 Enter는 조합 확정용이라 제출하지 않는다.
+      if (e.isComposing) return;
+      if (e.key === "Enter") close(input.value);
+      else if (e.key === "Escape") close(null);
+    });
+    setTimeout(() => { input.focus(); input.select(); }, 0);
+  });
+}
+
+async function renameSessionFromPane(pane: Pane) {
+  const sid = pane.sessionId;
+  if (!sid) return;
+  const project = pane.baseTitle.split(":")[0];
+  const current = pane.baseTitle.startsWith(project + ":") ? pane.baseTitle.slice(project.length + 1) : "";
+  const title = await promptText("세션 이름 (비우면 삭제):", current);
+  if (title === null) { pane.term.focus(); return; }
+  try {
+    await invoke("set_session_title", { sessionId: sid, title: title.trim() });
+    await emit("session-title-changed", { session_id: sid, title: title.trim() });
+  } catch (e) {
+    console.error("rename failed", e);
+  }
+  pane.term.focus();
+}
+
+tabsEl.addEventListener("dblclick", (e) => {
+  const tabEl = (e.target as HTMLElement).closest(".tab") as HTMLElement | null;
+  if (!tabEl || (e.target as HTMLElement).closest(".tab-close")) return;
+  const tab = tabs.get(tabEl.dataset.tabId!);
+  if (!tab) return;
+  const pane = tab.panes.find(p => p.id === tab.focusedPaneId) ?? tab.panes[0];
+  if (pane) void renameSessionFromPane(pane);
+});
+
 // ---------- Context menus ----------
 interface MenuItem { label: string; action: () => void; danger?: boolean; }
 
@@ -1662,6 +1782,10 @@ tabsEl.addEventListener("contextmenu", (e) => {
   if (!tab) return;
   const ap = tab.panes.find(p => p.id === tab.focusedPaneId) ?? tab.panes[0];
   const items: MenuItem[] = [];
+  if (ap && ap.sessionId) {
+    items.push({ label: "이름 변경", action: () => void renameSessionFromPane(ap) });
+    items.push({ label: "-", action: () => {} });
+  }
   if (ap && ap.sshArgs.length > 0) {
     items.push({ label: "같은 창에 탭 복제", action: () => void duplicateFromPane(ap, false) });
     items.push({ label: "새 창에 탭 복제", action: () => void duplicateFromPane(ap, true) });

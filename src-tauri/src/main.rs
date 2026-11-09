@@ -1,19 +1,19 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
 use uuid::Uuid;
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 // --- sessions-index.json structures ---
 
@@ -60,6 +60,9 @@ struct SessionInfo {
     // Started by `claude -p` / Agent SDK (entrypoint "sdk-*") rather than an interactive terminal.
     #[serde(default)]
     is_oneshot: bool,
+    // Title Claude Code generates on its own (the latest "ai-title" record).
+    #[serde(default)]
+    ai_title: String,
 }
 
 unsafe impl Send for SessionInfo {}
@@ -95,8 +98,17 @@ impl<'de> Deserialize<'de> for Labels {
         let mut labels = HashMap::new();
         for (k, v) in raw.labels {
             let vec = match v {
-                serde_json::Value::String(s) => if s.is_empty() { vec![] } else { vec![s] },
-                serde_json::Value::Array(arr) => arr.into_iter().filter_map(|item| item.as_str().map(String::from)).collect(),
+                serde_json::Value::String(s) => {
+                    if s.is_empty() {
+                        vec![]
+                    } else {
+                        vec![s]
+                    }
+                }
+                serde_json::Value::Array(arr) => arr
+                    .into_iter()
+                    .filter_map(|item| item.as_str().map(String::from))
+                    .collect(),
                 _ => vec![],
             };
             labels.insert(k, vec);
@@ -107,7 +119,9 @@ impl<'de> Deserialize<'de> for Labels {
 
 impl Serialize for Labels {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer {
+    where
+        S: serde::Serializer,
+    {
         use serde::ser::SerializeMap;
         let mut map = serializer.serialize_map(Some(1))?;
         map.serialize_entry("labels", &self.labels)?;
@@ -400,6 +414,8 @@ struct AppState {
     open_sessions: Mutex<Vec<OpenSessionEntry>>,
     // What was open when the app last ran; handed out once to the main window.
     restore_pending: Mutex<Option<Vec<OpenSessionEntry>>>,
+    // PTYs whose claude has exited while the tab is still open.
+    exited_terminals: Mutex<std::collections::HashSet<String>>,
     #[allow(dead_code)]
     runtime: tokio::runtime::Runtime,
 }
@@ -447,8 +463,11 @@ fn config_path() -> Result<PathBuf, String> {
 }
 
 fn load_config() -> AppConfig {
-    let Ok(p) = config_path() else { return AppConfig::default() };
-    fs::read_to_string(p).ok()
+    let Ok(p) = config_path() else {
+        return AppConfig::default();
+    };
+    fs::read_to_string(p)
+        .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
@@ -478,7 +497,10 @@ fn get_session_titles_path() -> Option<PathBuf> {
 }
 
 fn load_session_titles() -> HashMap<String, String> {
-    get_session_titles_path().and_then(|p| fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    get_session_titles_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 fn save_session_titles(titles: &HashMap<String, String>) -> Result<(), String> {
@@ -488,7 +510,10 @@ fn save_session_titles(titles: &HashMap<String, String>) -> Result<(), String> {
 }
 
 fn load_labels() -> Labels {
-    get_labels_path().and_then(|p| fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    get_labels_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 fn save_labels(labels: &Labels) -> Result<(), String> {
@@ -498,7 +523,10 @@ fn save_labels(labels: &Labels) -> Result<(), String> {
 }
 
 fn load_project_labels() -> HashMap<String, String> {
-    get_project_labels_path().and_then(|p| fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    get_project_labels_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 fn save_project_labels(labels: &HashMap<String, String>) -> Result<(), String> {
@@ -512,11 +540,20 @@ fn extract_first_prompt_from_jsonl(path: &Path) -> Option<String> {
     let reader = BufReader::with_capacity(16384, file);
     for line in reader.lines().take(30) {
         let line = line.ok()?;
-        if !line.contains("\"type\":\"user\"") && !line.contains("\"type\": \"user\"") { continue; }
-        let v: serde_json::Value = match serde_json::from_str(&line) { Ok(v) => v, Err(_) => continue };
-        if v.get("type").and_then(|t| t.as_str()) != Some("user") { continue; }
+        if !line.contains("\"type\":\"user\"") && !line.contains("\"type\": \"user\"") {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("user") {
+            continue;
+        }
         let msg = v.get("message")?;
-        if msg.get("role").and_then(|r| r.as_str()) != Some("user") { continue; }
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
         let content = msg.get("content")?;
         match content {
             serde_json::Value::String(s) => return Some(s.chars().take(200).collect()),
@@ -538,10 +575,16 @@ fn extract_first_prompt_from_jsonl(path: &Path) -> Option<String> {
 // `claude -p` and the Agent SDK write entrypoint "sdk-cli" / "sdk-ts" / "sdk-py";
 // interactive sessions write "cli" (or an IDE/desktop entrypoint). Old files have none.
 fn is_oneshot_session(path: &Path) -> bool {
-    let file = match fs::File::open(path) { Ok(f) => f, Err(_) => return false };
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
     let reader = BufReader::with_capacity(16384, file);
     for line in reader.lines().take(30) {
-        let line = match line { Ok(l) => l, Err(_) => return false };
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => return false,
+        };
         if let Some(i) = line.find("\"entrypoint\":\"") {
             return line[i + 14..].starts_with("sdk-");
         }
@@ -549,14 +592,43 @@ fn is_oneshot_session(path: &Path) -> bool {
     false
 }
 
+// Claude Code appends {"type":"ai-title","aiTitle":...} records as the
+// conversation goes and the last one wins. Only the file tail is read: these
+// files reach tens of MB, and a fresh record is always near the end.
+fn extract_ai_title(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 256 * 1024;
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let line = text.lines().rev().find(|l| l.contains("\"type\":\"ai-title\""))?;
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    v.get("aiTitle")?.as_str().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+}
+
 fn estimate_message_count(path: &Path) -> u32 {
-    fs::metadata(path).map(|m| std::cmp::max(1, (m.len() / 2048) as u32)).unwrap_or(1)
+    fs::metadata(path)
+        .map(|m| std::cmp::max(1, (m.len() / 2048) as u32))
+        .unwrap_or(1)
 }
 
 fn file_time_to_rfc3339(path: &Path, use_modified: bool) -> String {
-    fs::metadata(path).ok()
-        .and_then(|m| if use_modified { m.modified().ok() } else { m.created().ok() })
-        .map(|t| { let dt: chrono::DateTime<chrono::Utc> = t.into(); dt.to_rfc3339() })
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| {
+            if use_modified {
+                m.modified().ok()
+            } else {
+                m.created().ok()
+            }
+        })
+        .map(|t| {
+            let dt: chrono::DateTime<chrono::Utc> = t.into();
+            dt.to_rfc3339()
+        })
         .unwrap_or_default()
 }
 
@@ -565,55 +637,136 @@ fn decode_folder_to_path(folder: &str) -> String {
     let mut chars = folder.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '-' {
-            if chars.peek() == Some(&'-') { chars.next(); result.push(':'); result.push('\\'); }
-            else { result.push('\x00'); }
-        } else { result.push(ch); }
+            if chars.peek() == Some(&'-') {
+                chars.next();
+                result.push(':');
+                result.push('\\');
+            } else {
+                result.push('\x00');
+            }
+        } else {
+            result.push(ch);
+        }
     }
     resolve_ambiguous_path(&result)
 }
 
 fn resolve_ambiguous_path(template: &str) -> String {
     let parts: Vec<&str> = template.split('\x00').collect();
-    if parts.len() <= 1 { return template.replace('\x00', "-"); }
+    if parts.len() <= 1 {
+        return template.replace('\x00', "-");
+    }
     fn find_best(parts: &[&str], idx: usize, current: String) -> Option<String> {
-        if idx >= parts.len() { return if Path::new(&current).exists() { Some(current) } else { None }; }
-        if idx == 0 { return find_best(parts, 1, parts[0].to_string()); }
+        if idx >= parts.len() {
+            return if Path::new(&current).exists() {
+                Some(current)
+            } else {
+                None
+            };
+        }
+        if idx == 0 {
+            return find_best(parts, 1, parts[0].to_string());
+        }
         let with_sep = format!("{}\\{}", current, parts[idx]);
-        if let Some(r) = find_best(parts, idx + 1, with_sep) { return Some(r); }
+        if let Some(r) = find_best(parts, idx + 1, with_sep) {
+            return Some(r);
+        }
         let with_hyphen = format!("{}-{}", current, parts[idx]);
         find_best(parts, idx + 1, with_hyphen)
     }
-    if let Some(resolved) = find_best(&parts, 0, String::new()) { return resolved; }
+    if let Some(resolved) = find_best(&parts, 0, String::new()) {
+        return resolved;
+    }
     parts.join("\\")
 }
 
-fn scan_project(project_dir: &Path, folder_name: &str, account_name: &str, labels: &Labels, titles: &HashMap<String, String>) -> Vec<SessionInfo> {
+fn scan_project(
+    project_dir: &Path,
+    folder_name: &str,
+    account_name: &str,
+    labels: &Labels,
+    titles: &HashMap<String, String>,
+) -> Vec<SessionInfo> {
     let mut sessions = Vec::new();
     let index_path = project_dir.join("sessions-index.json");
     let index: Option<SessionsIndex> = if index_path.exists() {
-        fs::read_to_string(&index_path).ok().and_then(|s| serde_json::from_str(&s).ok())
-    } else { None };
-    let project_path = index.as_ref().and_then(|i| i.original_path.clone()).unwrap_or_else(|| decode_folder_to_path(folder_name));
-    let indexed: HashMap<String, &IndexEntry> = index.as_ref()
-        .map(|idx| idx.entries.iter().map(|e| (e.session_id.clone(), e)).collect())
+        fs::read_to_string(&index_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    } else {
+        None
+    };
+    let project_path = index
+        .as_ref()
+        .and_then(|i| i.original_path.clone())
+        .unwrap_or_else(|| decode_folder_to_path(folder_name));
+    let indexed: HashMap<String, &IndexEntry> = index
+        .as_ref()
+        .map(|idx| {
+            idx.entries
+                .iter()
+                .map(|e| (e.session_id.clone(), e))
+                .collect()
+        })
         .unwrap_or_default();
-    let jsonl_files: Vec<_> = fs::read_dir(project_dir).into_iter().flatten().flatten()
-        .filter(|e| { let p = e.path(); !p.is_dir() && p.extension().map(|ext| ext == "jsonl").unwrap_or(false) })
+    let jsonl_files: Vec<_> = fs::read_dir(project_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            let p = e.path();
+            !p.is_dir() && p.extension().map(|ext| ext == "jsonl").unwrap_or(false)
+        })
         .collect();
     for file_entry in jsonl_files {
         let file_path = file_entry.path();
-        let session_id = file_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let session_id = file_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         let labels_vec = labels.labels.get(&session_id).cloned().unwrap_or_default();
         let custom_title = titles.get(&session_id).cloned().unwrap_or_default();
         let is_oneshot = is_oneshot_session(&file_path);
+        let ai_title = extract_ai_title(&file_path).unwrap_or_default();
         if let Some(idx) = indexed.get(&session_id) {
-            sessions.push(SessionInfo { session_id, first_prompt: idx.first_prompt.clone().unwrap_or_default(), summary: idx.summary.clone().unwrap_or_default(), message_count: idx.message_count, created: idx.created.clone().unwrap_or_default(), modified: idx.modified.clone().unwrap_or_default(), git_branch: idx.git_branch.clone().unwrap_or_default(), project_path: project_path.clone(), project_folder: folder_name.to_string(), labels: labels_vec, custom_title, account_name: account_name.to_string(), is_oneshot });
+            sessions.push(SessionInfo {
+                session_id,
+                first_prompt: idx.first_prompt.clone().unwrap_or_default(),
+                summary: idx.summary.clone().unwrap_or_default(),
+                message_count: idx.message_count,
+                created: idx.created.clone().unwrap_or_default(),
+                modified: idx.modified.clone().unwrap_or_default(),
+                git_branch: idx.git_branch.clone().unwrap_or_default(),
+                project_path: project_path.clone(),
+                project_folder: folder_name.to_string(),
+                labels: labels_vec,
+                custom_title,
+                account_name: account_name.to_string(),
+                is_oneshot,
+                ai_title: ai_title.clone(),
+            });
         } else {
             let first_prompt = extract_first_prompt_from_jsonl(&file_path).unwrap_or_default();
             let msg_count = estimate_message_count(&file_path);
             let modified = file_time_to_rfc3339(&file_path, true);
             let created = file_time_to_rfc3339(&file_path, false);
-            sessions.push(SessionInfo { session_id, first_prompt, summary: String::new(), message_count: msg_count, created, modified, git_branch: String::new(), project_path: project_path.clone(), project_folder: folder_name.to_string(), labels: labels_vec, custom_title, account_name: account_name.to_string(), is_oneshot });
+            sessions.push(SessionInfo {
+                session_id,
+                first_prompt,
+                summary: String::new(),
+                message_count: msg_count,
+                created,
+                modified,
+                git_branch: String::new(),
+                project_path: project_path.clone(),
+                project_folder: folder_name.to_string(),
+                labels: labels_vec,
+                custom_title,
+                account_name: account_name.to_string(),
+                is_oneshot,
+                ai_title: ai_title.clone(),
+            });
         }
     }
     sessions
@@ -624,15 +777,28 @@ fn scan_all_sessions() -> Result<Vec<SessionInfo>, String> {
     let titles = load_session_titles();
     let mut all_sessions: Vec<SessionInfo> = Vec::new();
     for (account_name, projects_dir) in all_projects_dirs() {
-        if !projects_dir.exists() { continue; }
+        if !projects_dir.exists() {
+            continue;
+        }
         let project_dirs: Vec<_> = match fs::read_dir(&projects_dir) {
-            Ok(r) => r.flatten().filter(|e| e.path().is_dir()).map(|e| e.path()).collect(),
+            Ok(r) => r
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.path())
+                .collect(),
             Err(_) => continue,
         };
-        let mut scanned: Vec<SessionInfo> = project_dirs.par_iter().flat_map(|dir| {
-            let folder = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
-            scan_project(dir, &folder, &account_name, &labels, &titles)
-        }).collect();
+        let mut scanned: Vec<SessionInfo> = project_dirs
+            .par_iter()
+            .flat_map(|dir| {
+                let folder = dir
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                scan_project(dir, &folder, &account_name, &labels, &titles)
+            })
+            .collect();
         all_sessions.append(&mut scanned);
     }
     all_sessions.par_sort_unstable_by(|a, b| b.modified.cmp(&a.modified));
@@ -640,8 +806,17 @@ fn scan_all_sessions() -> Result<Vec<SessionInfo>, String> {
 }
 
 fn cleanup_empty_project(project_dir: &Path) {
-    let has_sessions = fs::read_dir(project_dir).map(|entries| entries.flatten().any(|e| { let p = e.path(); !p.is_dir() && p.extension().map(|ext| ext == "jsonl").unwrap_or(false) })).unwrap_or(false);
-    if !has_sessions { let _ = fs::remove_dir_all(project_dir); }
+    let has_sessions = fs::read_dir(project_dir)
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                let p = e.path();
+                !p.is_dir() && p.extension().map(|ext| ext == "jsonl").unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    if !has_sessions {
+        let _ = fs::remove_dir_all(project_dir);
+    }
 }
 
 // --- Tauri Commands: session management ---
@@ -649,7 +824,9 @@ fn cleanup_empty_project(project_dir: &Path) {
 #[tauri::command]
 fn get_sessions(cache: State<Mutex<AppCache>>) -> Result<Vec<SessionInfo>, String> {
     let sessions = scan_all_sessions()?;
-    if let Ok(mut c) = cache.lock() { c.sessions = sessions.clone(); }
+    if let Ok(mut c) = cache.lock() {
+        c.sessions = sessions.clone();
+    }
     Ok(sessions)
 }
 
@@ -660,18 +837,55 @@ fn get_projects() -> Result<Vec<ProjectInfo>, String> {
     // both account names listed.
     let mut by_folder: HashMap<String, ProjectInfo> = HashMap::new();
     for (account_name, projects_dir) in all_projects_dirs() {
-        if !projects_dir.exists() { continue; }
+        if !projects_dir.exists() {
+            continue;
+        }
         let project_dirs: Vec<_> = match fs::read_dir(&projects_dir) {
-            Ok(r) => r.flatten().filter(|e| e.path().is_dir()).map(|e| e.path()).collect(),
+            Ok(r) => r
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.path())
+                .collect(),
             Err(_) => continue,
         };
-        let scanned: Vec<ProjectInfo> = project_dirs.par_iter().map(|path| {
-            let folder_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let session_count = fs::read_dir(path).map(|entries| entries.flatten().filter(|e| { let p = e.path(); !p.is_dir() && p.extension().map(|ext| ext == "jsonl").unwrap_or(false) }).count() as u32).unwrap_or(0);
-            let index_path = path.join("sessions-index.json");
-            let project_path = if index_path.exists() { fs::read_to_string(&index_path).ok().and_then(|s| serde_json::from_str::<SessionsIndex>(&s).ok()).and_then(|i| i.original_path).unwrap_or_else(|| decode_folder_to_path(&folder_name)) } else { decode_folder_to_path(&folder_name) };
-            ProjectInfo { folder_name, project_path, session_count, account_names: vec![account_name.clone()] }
-        }).collect();
+        let scanned: Vec<ProjectInfo> = project_dirs
+            .par_iter()
+            .map(|path| {
+                let folder_name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let session_count = fs::read_dir(path)
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .filter(|e| {
+                                let p = e.path();
+                                !p.is_dir()
+                                    && p.extension().map(|ext| ext == "jsonl").unwrap_or(false)
+                            })
+                            .count() as u32
+                    })
+                    .unwrap_or(0);
+                let index_path = path.join("sessions-index.json");
+                let project_path = if index_path.exists() {
+                    fs::read_to_string(&index_path)
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<SessionsIndex>(&s).ok())
+                        .and_then(|i| i.original_path)
+                        .unwrap_or_else(|| decode_folder_to_path(&folder_name))
+                } else {
+                    decode_folder_to_path(&folder_name)
+                };
+                ProjectInfo {
+                    folder_name,
+                    project_path,
+                    session_count,
+                    account_names: vec![account_name.clone()],
+                }
+            })
+            .collect();
         for p in scanned {
             by_folder
                 .entry(p.folder_name.clone())
@@ -690,19 +904,29 @@ fn get_projects() -> Result<Vec<ProjectInfo>, String> {
 }
 
 #[tauri::command]
-fn get_project_labels() -> Result<HashMap<String, String>, String> { Ok(load_project_labels()) }
+fn get_project_labels() -> Result<HashMap<String, String>, String> {
+    Ok(load_project_labels())
+}
 
 #[tauri::command]
 fn set_project_label(project_folder: String, label: String) -> Result<(), String> {
     let mut labels = load_project_labels();
-    if label.is_empty() { labels.remove(&project_folder); } else { labels.insert(project_folder, label); }
+    if label.is_empty() {
+        labels.remove(&project_folder);
+    } else {
+        labels.insert(project_folder, label);
+    }
     save_project_labels(&labels)
 }
 
 #[tauri::command]
 fn set_session_title(session_id: String, title: String) -> Result<(), String> {
     let mut titles = load_session_titles();
-    if title.is_empty() { titles.remove(&session_id); } else { titles.insert(session_id, title); }
+    if title.is_empty() {
+        titles.remove(&session_id);
+    } else {
+        titles.insert(session_id, title);
+    }
     save_session_titles(&titles)
 }
 
@@ -710,69 +934,114 @@ fn set_session_title(session_id: String, title: String) -> Result<(), String> {
 fn set_labels(session_id: String, labels: Vec<String>) -> Result<(), String> {
     let mut all_labels = load_labels();
     let filtered: Vec<String> = labels.into_iter().filter(|l| !l.is_empty()).collect();
-    if filtered.is_empty() { all_labels.labels.remove(&session_id); } else { all_labels.labels.insert(session_id, filtered); }
+    if filtered.is_empty() {
+        all_labels.labels.remove(&session_id);
+    } else {
+        all_labels.labels.insert(session_id, filtered);
+    }
     save_labels(&all_labels)
 }
 
 fn projects_dir_for_account_name(name: &str) -> Option<PathBuf> {
-    load_accounts().iter().find(|a| a.name == name).and_then(account_projects_dir)
+    load_accounts()
+        .iter()
+        .find(|a| a.name == name)
+        .and_then(account_projects_dir)
 }
 
 #[tauri::command]
-fn delete_session(session_id: String, project_folder: String, account_name: Option<String>) -> Result<(), String> {
+fn delete_session(
+    session_id: String,
+    project_folder: String,
+    account_name: Option<String>,
+) -> Result<(), String> {
     let projects_dir = match account_name.as_deref() {
         Some(n) => projects_dir_for_account_name(n).ok_or("계정 dir 없음")?,
         None => get_claude_projects_dir().ok_or("Cannot find .claude/projects")?,
     };
     let project_dir = projects_dir.join(&project_folder);
     let jsonl_path = project_dir.join(format!("{}.jsonl", session_id));
-    if jsonl_path.exists() { fs::remove_file(&jsonl_path).map_err(|e| e.to_string())?; }
+    if jsonl_path.exists() {
+        fs::remove_file(&jsonl_path).map_err(|e| e.to_string())?;
+    }
     let data_dir = project_dir.join(&session_id);
-    if data_dir.exists() && data_dir.is_dir() { fs::remove_dir_all(&data_dir).map_err(|e| e.to_string())?; }
+    if data_dir.exists() && data_dir.is_dir() {
+        fs::remove_dir_all(&data_dir).map_err(|e| e.to_string())?;
+    }
     let index_path = project_dir.join("sessions-index.json");
     if index_path.exists() {
         if let Ok(content) = fs::read_to_string(&index_path) {
             if let Ok(mut index) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(entries) = index.get_mut("entries").and_then(|e| e.as_array_mut()) {
-                    entries.retain(|e| e.get("sessionId").and_then(|s| s.as_str()) != Some(&session_id));
+                    entries.retain(|e| {
+                        e.get("sessionId").and_then(|s| s.as_str()) != Some(&session_id)
+                    });
                 }
-                let _ = fs::write(&index_path, serde_json::to_string_pretty(&index).unwrap_or_default());
+                let _ = fs::write(
+                    &index_path,
+                    serde_json::to_string_pretty(&index).unwrap_or_default(),
+                );
             }
         }
     }
-    let mut labels = load_labels(); labels.labels.remove(&session_id); let _ = save_labels(&labels);
-    let mut titles = load_session_titles(); titles.remove(&session_id); let _ = save_session_titles(&titles);
-    let mut smap = load_session_account_map(); smap.remove(&session_id); let _ = save_session_account_map(&smap);
+    let mut labels = load_labels();
+    labels.labels.remove(&session_id);
+    let _ = save_labels(&labels);
+    let mut titles = load_session_titles();
+    titles.remove(&session_id);
+    let _ = save_session_titles(&titles);
+    let mut smap = load_session_account_map();
+    smap.remove(&session_id);
+    let _ = save_session_account_map(&smap);
     cleanup_empty_project(&project_dir);
     Ok(())
 }
 
 #[tauri::command]
-fn delete_project_sessions(project_folder: String, account_name: Option<String>) -> Result<u32, String> {
+fn delete_project_sessions(
+    project_folder: String,
+    account_name: Option<String>,
+) -> Result<u32, String> {
     // If account_name given, only that one. Otherwise wipe the project folder
     // across every account (the "nuke this project" semantic).
     let target_dirs: Vec<PathBuf> = match account_name.as_deref() {
-        Some(n) => projects_dir_for_account_name(n).into_iter().map(|d| d.join(&project_folder)).collect(),
-        None => all_projects_dirs().into_iter().map(|(_, d)| d.join(&project_folder)).collect(),
+        Some(n) => projects_dir_for_account_name(n)
+            .into_iter()
+            .map(|d| d.join(&project_folder))
+            .collect(),
+        None => all_projects_dirs()
+            .into_iter()
+            .map(|(_, d)| d.join(&project_folder))
+            .collect(),
     };
     let mut deleted = 0u32;
     let mut labels = load_labels();
     let mut titles = load_session_titles();
     let mut smap = load_session_account_map();
     for project_dir in target_dirs {
-        if !project_dir.exists() { continue; }
+        if !project_dir.exists() {
+            continue;
+        }
         let entries: Vec<_> = match fs::read_dir(&project_dir) {
             Ok(r) => r.flatten().collect(),
             Err(_) => continue,
         };
         for entry in &entries {
             let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             if name.ends_with(".jsonl") {
                 let sid = name.trim_end_matches(".jsonl");
-                labels.labels.remove(sid); titles.remove(sid); smap.remove(sid);
+                labels.labels.remove(sid);
+                titles.remove(sid);
+                smap.remove(sid);
                 let data_dir = project_dir.join(sid);
-                if data_dir.is_dir() { let _ = fs::remove_dir_all(&data_dir); }
+                if data_dir.is_dir() {
+                    let _ = fs::remove_dir_all(&data_dir);
+                }
                 let _ = fs::remove_file(&path);
                 deleted += 1;
             }
@@ -809,10 +1078,13 @@ struct OpenSessionEntry {
     account_name: Option<String>,
 }
 
-fn open_sessions_path() -> Result<PathBuf, String> { Ok(get_config_dir()?.join("open-sessions.json")) }
+fn open_sessions_path() -> Result<PathBuf, String> {
+    Ok(get_config_dir()?.join("open-sessions.json"))
+}
 
 fn load_open_sessions() -> Vec<OpenSessionEntry> {
-    open_sessions_path().ok()
+    open_sessions_path()
+        .ok()
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
@@ -832,7 +1104,9 @@ fn split_session_args(args: &[String]) -> (Option<String>, Vec<String>) {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "--resume" || a == "--session-id" {
-            if let Some(v) = it.next() { sid = Some(v.clone()); }
+            if let Some(v) = it.next() {
+                sid = Some(v.clone());
+            }
         } else {
             rest.push(a.clone());
         }
@@ -843,20 +1117,70 @@ fn split_session_args(args: &[String]) -> (Option<String>, Vec<String>) {
 fn session_jsonl_exists(session_id: &str, env: &HashMap<String, String>) -> bool {
     let projects = match env.get("CLAUDE_CONFIG_DIR") {
         Some(dir) => PathBuf::from(dir).join("projects"),
-        None => match get_claude_projects_dir() { Some(p) => p, None => return false },
+        None => match get_claude_projects_dir() {
+            Some(p) => p,
+            None => return false,
+        },
     };
     let file = format!("{}.jsonl", session_id);
-    fs::read_dir(projects).into_iter().flatten().flatten().any(|e| e.path().join(&file).is_file())
+    fs::read_dir(projects)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| e.path().join(&file).is_file())
+}
+
+#[derive(Serialize)]
+struct LiveSession {
+    session_id: String,
+    // false until the first message creates the jsonl (not in the sidebar yet)
+    has_jsonl: bool,
+}
+
+// Sessions whose claude is running in some tab right now, in any window.
+#[tauri::command]
+fn get_open_sessions(state: State<AppState>) -> Vec<LiveSession> {
+    let exited = state.exited_terminals.lock().unwrap().clone();
+    let open = state.open_sessions.lock().unwrap().clone();
+    let mut seen = std::collections::HashSet::new();
+    open.into_iter()
+        .filter(|e| !exited.contains(&e.terminal_id) && seen.insert(e.session_id.clone()))
+        .map(|e| LiveSession {
+            has_jsonl: session_jsonl_exists(&e.session_id, &e.env),
+            session_id: e.session_id,
+        })
+        .collect()
+}
+
+// A pane that moved between windows only keeps its terminal id.
+#[tauri::command]
+fn session_id_for_terminal(terminal_id: String, state: State<AppState>) -> Option<String> {
+    state
+        .open_sessions
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|e| e.terminal_id == terminal_id)
+        .map(|e| e.session_id.clone())
 }
 
 #[tauri::command]
 fn take_restore_sessions(state: State<AppState>) -> Vec<OpenSessionEntry> {
-    let prev = state.restore_pending.lock().unwrap().take().unwrap_or_default();
-    if !load_config().restore_sessions.unwrap_or(true) { return Vec::new(); }
+    let prev = state
+        .restore_pending
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap_or_default();
+    if !load_config().restore_sessions.unwrap_or(true) {
+        return Vec::new();
+    }
     let mut seen = std::collections::HashSet::new();
     prev.into_iter()
         // A session that never got a message has no jsonl and cannot be resumed.
-        .filter(|e| seen.insert(e.session_id.clone()) && session_jsonl_exists(&e.session_id, &e.env))
+        .filter(|e| {
+            seen.insert(e.session_id.clone()) && session_jsonl_exists(&e.session_id, &e.env)
+        })
         .collect()
 }
 
@@ -875,6 +1199,12 @@ async fn open_session(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let mut args: Vec<String> = Vec::new();
+    // New sessions get their id here, so every tab knows its session from the
+    // start (title sync and "focus the open tab" both key on it).
+    if session_id.is_none() {
+        args.push("--session-id".to_string());
+        args.push(Uuid::new_v4().to_string());
+    }
     if let Some(sid) = &session_id {
         args.push("--resume".to_string());
         args.push(sid.clone());
@@ -895,18 +1225,27 @@ async fn open_session(
     let account_name = match account.filter(|s| !s.trim().is_empty()) {
         Some(a) if accounts.iter().any(|x| x.name == a) => a,
         _ => {
-            let labels = session_id.as_deref().map(labels_for_session).unwrap_or_default();
+            let labels = session_id
+                .as_deref()
+                .map(labels_for_session)
+                .unwrap_or_default();
             resolve_account_name(session_id.as_deref(), &labels, &accounts)
         }
     };
-    let acc = accounts.iter().find(|a| a.name == account_name).cloned()
+    let acc = accounts
+        .iter()
+        .find(|a| a.name == account_name)
+        .cloned()
         .unwrap_or_else(default_account);
 
     let mut env = HashMap::new();
     if let Some(dir) = account_config_dir(&acc) {
         // Ensure the dir exists so Claude can write its session jsonl there.
         let _ = fs::create_dir_all(&dir);
-        env.insert("CLAUDE_CONFIG_DIR".to_string(), dir.to_string_lossy().to_string());
+        env.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            dir.to_string_lossy().to_string(),
+        );
     }
 
     let terminal_id = Uuid::new_v4().to_string();
@@ -925,24 +1264,34 @@ async fn open_session(
     } else if app.get_webview_window("main").is_some() {
         Some("main".to_string())
     } else {
-        app.webview_windows().keys().find(|label| label.starts_with("term-")).cloned()
+        app.webview_windows()
+            .keys()
+            .find(|label| label.starts_with("term-"))
+            .cloned()
     };
     if let Some(label) = existing_label {
         if let Some(window) = app.get_webview_window(&label) {
             let _ = window.unminimize();
             let _ = window.set_focus();
-            window.emit_to(label.as_str(), "add-tab", payload).map_err(|e| e.to_string())?;
+            window
+                .emit_to(label.as_str(), "add-tab", payload)
+                .map_err(|e| e.to_string())?;
         }
     } else {
         let label = format!("term-{}", Uuid::new_v4().simple());
-        state.pending_tabs.lock().unwrap().insert(label.clone(), payload);
+        state
+            .pending_tabs
+            .lock()
+            .unwrap()
+            .insert(label.clone(), payload);
         WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
             .title(title)
             .inner_size(1100.0, 720.0)
             .min_inner_size(640.0, 400.0)
             .resizable(true)
             .disable_drag_drop_handler()
-            .build().map_err(|e| e.to_string())?;
+            .build()
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -983,21 +1332,39 @@ fn pty_spawn(
     account_name: Option<String>,
     app: AppHandle,
     state: State<AppState>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let (sid, base_args) = split_session_args(&ssh_args);
-    let mut ssh_args = ssh_args;
-    let session_id = match sid {
-        Some(s) => s,
-        None => {
-            let s = Uuid::new_v4().to_string();
-            ssh_args.push("--session-id".to_string());
-            ssh_args.push(s.clone());
-            s
-        }
+    let env_map = env.clone().unwrap_or_default();
+    let had_resume = ssh_args.iter().any(|a| a == "--resume");
+    // A duplicated or same-session split pane carries the original's
+    // `--session-id X`, which claude refuses once X is taken. Resume X instead,
+    // or start fresh if X never got a message.
+    let taken = |id: &str| {
+        state
+            .open_sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.session_id == id)
     };
+    let (session_id, resume) = match sid {
+        Some(s) if had_resume => (s, true),
+        Some(s) if taken(&s) => {
+            if session_jsonl_exists(&s, &env_map) {
+                (s, true)
+            } else {
+                (Uuid::new_v4().to_string(), false)
+            }
+        }
+        Some(s) => (s, false),
+        None => (Uuid::new_v4().to_string(), false),
+    };
+    let mut ssh_args = base_args.clone();
+    ssh_args.push(if resume { "--resume" } else { "--session-id" }.to_string());
+    ssh_args.push(session_id.clone());
     let entry = OpenSessionEntry {
         terminal_id: terminal_id.clone(),
-        session_id,
+        session_id: session_id.clone(),
         cwd: cwd.clone(),
         args: base_args,
         env: env.clone().unwrap_or_default(),
@@ -1005,7 +1372,14 @@ fn pty_spawn(
         account_name,
     };
     let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| format!("openpty failed: {}", e))?;
+    let pair = pty_system
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("openpty failed: {}", e))?;
     // On Windows, `claude` is a Node.js shim (.cmd file). CreateProcessW
     // cannot execute .cmd directly, so we wrap through cmd.exe /c. On Unix,
     // `claude` is a shell script / binary and runs directly.
@@ -1017,15 +1391,22 @@ fn pty_spawn(
     } else {
         CommandBuilder::new("claude")
     };
-    for a in &ssh_args { cmd.arg(a); }
-    if let Some(dir) = &cwd { cmd.cwd(dir); }
+    for a in &ssh_args {
+        cmd.arg(a);
+    }
+    if let Some(dir) = &cwd {
+        cmd.cwd(dir);
+    }
     cmd.env("TERM", "xterm-256color");
     if let Some(extra) = env {
         for (k, v) in extra {
             cmd.env(k, v);
         }
     }
-    let child = pair.slave.spawn_command(cmd).map_err(|e| format!("spawn failed: {}", e))?;
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("spawn failed: {}", e))?;
     drop(pair.slave);
     // Cage the child immediately, before `cmd.exe /c claude` has had time to
     // start Node and its MCP servers, so the entire tree becomes a job member
@@ -1041,15 +1422,31 @@ fn pty_spawn(
         },
         None => None,
     };
-    let mut reader = pair.master.try_clone_reader().map_err(|e| format!("clone reader failed: {}", e))?;
-    let writer = pair.master.take_writer().map_err(|e| format!("take writer failed: {}", e))?;
-    let instance = Arc::new(PtyInstance { master: Mutex::new(pair.master), writer: Mutex::new(writer), child: Mutex::new(child), _job: job });
-    state.ptys.lock().unwrap().insert(terminal_id.clone(), instance);
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("clone reader failed: {}", e))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("take writer failed: {}", e))?;
+    let instance = Arc::new(PtyInstance {
+        master: Mutex::new(pair.master),
+        writer: Mutex::new(writer),
+        child: Mutex::new(child),
+        _job: job,
+    });
+    state
+        .ptys
+        .lock()
+        .unwrap()
+        .insert(terminal_id.clone(), instance);
     {
         let mut open = state.open_sessions.lock().unwrap();
         open.push(entry);
         save_open_sessions(&open);
     }
+    let _ = app.emit("open-sessions-changed", ());
     // When claude_verbose is on, tee PTY output to a timestamped log file.
     let verbose = load_config().claude_verbose.unwrap_or(false);
     let mut log_file: Option<File> = None;
@@ -1070,15 +1467,27 @@ fn pty_spawn(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let _ = app_clone.emit("pty-output", PtyOutputPayload { terminal_id: tid.clone(), data: buf[..n].to_vec() });
-                    if let Some(f) = log.as_mut() { let _ = f.write_all(&buf[..n]); }
+                    let _ = app_clone.emit(
+                        "pty-output",
+                        PtyOutputPayload {
+                            terminal_id: tid.clone(),
+                            data: buf[..n].to_vec(),
+                        },
+                    );
+                    if let Some(f) = log.as_mut() {
+                        let _ = f.write_all(&buf[..n]);
+                    }
                 }
                 Err(_) => break,
             }
         }
+        if let Some(st) = app_clone.try_state::<AppState>() {
+            st.exited_terminals.lock().unwrap().insert(tid.clone());
+        }
         let _ = app_clone.emit("pty-exit", PtyExitPayload { terminal_id: tid });
+        let _ = app_clone.emit("open-sessions-changed", ());
     });
-    Ok(())
+    Ok(session_id)
 }
 
 #[tauri::command]
@@ -1093,11 +1502,25 @@ fn pty_write(terminal_id: String, data: Vec<u8>, state: State<AppState>) -> Resu
 }
 
 #[tauri::command]
-fn pty_resize(terminal_id: String, rows: u16, cols: u16, state: State<AppState>) -> Result<(), String> {
+fn pty_resize(
+    terminal_id: String,
+    rows: u16,
+    cols: u16,
+    state: State<AppState>,
+) -> Result<(), String> {
     let ptys = state.ptys.lock().unwrap();
     let pty = ptys.get(&terminal_id).ok_or("Unknown terminal")?.clone();
     drop(ptys);
-    pty.master.lock().unwrap().resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| e.to_string())?;
+    pty.master
+        .lock()
+        .unwrap()
+        .resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1137,7 +1560,9 @@ fn kill_pty_tree(pty: &PtyInstance) {
     }
     // Still reap the direct child: on Unix this is the actual kill, and on
     // Windows it releases the handle if taskkill could not resolve the pid.
-    if let Ok(mut c) = pty.child.lock() { let _ = c.kill(); }
+    if let Ok(mut c) = pty.child.lock() {
+        let _ = c.kill();
+    }
 }
 
 // Kill a batch of PTYs off the main thread.
@@ -1153,11 +1578,18 @@ fn kill_pty_tree(pty: &PtyInstance) {
 async fn kill_terminals(ids: Vec<String>, state: &AppState) {
     let targets: Vec<(String, Arc<PtyInstance>)> = {
         let ptys = state.ptys.lock().unwrap();
-        ids.iter().filter_map(|id| ptys.get(id).map(|p| (id.clone(), p.clone()))).collect()
+        ids.iter()
+            .filter_map(|id| ptys.get(id).map(|p| (id.clone(), p.clone())))
+            .collect()
     };
     let jobs: Vec<_> = targets
         .into_iter()
-        .map(|(id, pty)| tauri::async_runtime::spawn_blocking(move || { kill_pty_tree(&pty); id }))
+        .map(|(id, pty)| {
+            tauri::async_runtime::spawn_blocking(move || {
+                kill_pty_tree(&pty);
+                id
+            })
+        })
         .collect();
     for job in jobs {
         if let Ok(id) = job.await {
@@ -1168,13 +1600,19 @@ async fn kill_terminals(ids: Vec<String>, state: &AppState) {
 }
 
 #[tauri::command]
-async fn pty_kill_many(terminal_ids: Vec<String>, forget: Option<bool>, state: State<'_, AppState>) -> Result<(), String> {
+async fn pty_kill_many(
+    terminal_ids: Vec<String>,
+    forget: Option<bool>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     if forget.unwrap_or(true) {
         let mut open = state.open_sessions.lock().unwrap();
         open.retain(|e| !terminal_ids.contains(&e.terminal_id));
         save_open_sessions(&open);
     }
     kill_terminals(terminal_ids, &state).await;
+    let _ = app.emit("open-sessions-changed", ());
     Ok(())
 }
 
@@ -1198,7 +1636,8 @@ async fn drop_tab(
     // the OS gives ground truth and physical-pixel comparison handles
     // multi-monitor mixed-DPI setups correctly.
     let cur_pos = app.cursor_position().ok();
-    let src_scale = app.get_webview_window(&source_label)
+    let src_scale = app
+        .get_webview_window(&source_label)
         .and_then(|w| w.scale_factor().ok())
         .unwrap_or(1.0);
     let (cur_x, cur_y) = match cur_pos {
@@ -1208,16 +1647,40 @@ async fn drop_tab(
     for (label, window) in app.webview_windows() {
         // "main" is also a valid merge target — without this, dragging a
         // tab from a sub-window back into the main window silently fails.
-        if label != "main" && !label.starts_with("term-") { continue; }
-        if label == source_label { continue; }
-        let Ok(pos) = window.outer_position() else { continue };
-        let Ok(size) = window.outer_size() else { continue };
+        if label != "main" && !label.starts_with("term-") {
+            continue;
+        }
+        if label == source_label {
+            continue;
+        }
+        let Ok(pos) = window.outer_position() else {
+            continue;
+        };
+        let Ok(size) = window.outer_size() else {
+            continue;
+        };
         let x0 = pos.x as f64;
         let y0 = pos.y as f64;
         let x1 = x0 + size.width as f64;
         let y1 = y0 + size.height as f64;
         if cur_x >= x0 && cur_x < x1 && cur_y >= y0 && cur_y < y1 {
-            window.emit_to(label.as_str(), "merge-tab", MergeTabPayload { terminal_id, title, ssh_args, cwd, initial_content, screen_x, screen_y, env: HashMap::new(), account_name: None }).map_err(|e| e.to_string())?;
+            window
+                .emit_to(
+                    label.as_str(),
+                    "merge-tab",
+                    MergeTabPayload {
+                        terminal_id,
+                        title,
+                        ssh_args,
+                        cwd,
+                        initial_content,
+                        screen_x,
+                        screen_y,
+                        env: HashMap::new(),
+                        account_name: None,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
             let _ = window.set_focus();
             return Ok(true);
         }
@@ -1226,10 +1689,25 @@ async fn drop_tab(
     // the only tab out of a sub-window into a fresh window of the same
     // kind is a no-op. Main keeps a placeholder when its last tab leaves,
     // so detaching from main is meaningful.
-    if is_last_tab && source_label.starts_with("term-") { return Ok(false); }
+    if is_last_tab && source_label.starts_with("term-") {
+        return Ok(false);
+    }
     let label = format!("term-{}", Uuid::new_v4().simple());
-    let payload = AddTabPayload { terminal_id, title: title.clone(), ssh_args, cwd, adopt: true, initial_content, env: HashMap::new(), account_name: None };
-    state.pending_tabs.lock().unwrap().insert(label.clone(), payload);
+    let payload = AddTabPayload {
+        terminal_id,
+        title: title.clone(),
+        ssh_args,
+        cwd,
+        adopt: true,
+        initial_content,
+        env: HashMap::new(),
+        account_name: None,
+    };
+    state
+        .pending_tabs
+        .lock()
+        .unwrap()
+        .insert(label.clone(), payload);
     WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
         .title(title)
         .inner_size(1100.0, 720.0)
@@ -1237,7 +1715,8 @@ async fn drop_tab(
         .resizable(true)
         .position(screen_x - 100.0, screen_y - 20.0)
         .disable_drag_drop_handler()
-        .build().map_err(|e| e.to_string())?;
+        .build()
+        .map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -1252,29 +1731,53 @@ async fn spawn_terminal(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let terminal_id = Uuid::new_v4().to_string();
-    let payload = AddTabPayload { terminal_id, title: title.clone(), ssh_args, cwd, adopt: false, initial_content: String::new(), env: HashMap::new(), account_name: None };
+    let payload = AddTabPayload {
+        terminal_id,
+        title: title.clone(),
+        ssh_args,
+        cwd,
+        adopt: false,
+        initial_content: String::new(),
+        env: HashMap::new(),
+        account_name: None,
+    };
     if new_window {
         let label = format!("term-{}", Uuid::new_v4().simple());
-        state.pending_tabs.lock().unwrap().insert(label.clone(), payload);
+        state
+            .pending_tabs
+            .lock()
+            .unwrap()
+            .insert(label.clone(), payload);
         WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
-            .title(title).inner_size(1100.0, 720.0).min_inner_size(640.0, 400.0).resizable(true).disable_drag_drop_handler()
-            .build().map_err(|e| e.to_string())?;
+            .title(title)
+            .inner_size(1100.0, 720.0)
+            .min_inner_size(640.0, 400.0)
+            .resizable(true)
+            .disable_drag_drop_handler()
+            .build()
+            .map_err(|e| e.to_string())?;
     } else if let Some(window) = app.get_webview_window(&source_label) {
-        let _ = window.unminimize(); let _ = window.set_focus();
-        window.emit_to(source_label.as_str(), "add-tab", payload).map_err(|e| e.to_string())?;
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        window
+            .emit_to(source_label.as_str(), "add-tab", payload)
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
 #[tauri::command]
-fn get_terminal_theme() -> Option<String> { load_config().terminal_theme }
+fn get_terminal_theme() -> Option<String> {
+    load_config().terminal_theme
+}
 
 #[tauri::command]
 fn set_terminal_theme(name: String, app: AppHandle) -> Result<(), String> {
     let mut cfg = load_config();
     cfg.terminal_theme = Some(name.clone());
     save_config(&cfg)?;
-    app.emit("terminal-theme-changed", name).map_err(|e| e.to_string())?;
+    app.emit("terminal-theme-changed", name)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1317,9 +1820,18 @@ fn get_metadata_paths() -> Result<MetadataPaths, String> {
     let claude_dir = home.join(".claude");
     Ok(MetadataPaths {
         claude_dir: claude_dir.to_string_lossy().to_string(),
-        session_labels: claude_dir.join("session-labels.json").to_string_lossy().to_string(),
-        project_labels: claude_dir.join("project-labels.json").to_string_lossy().to_string(),
-        session_titles: claude_dir.join("session-titles.json").to_string_lossy().to_string(),
+        session_labels: claude_dir
+            .join("session-labels.json")
+            .to_string_lossy()
+            .to_string(),
+        project_labels: claude_dir
+            .join("project-labels.json")
+            .to_string_lossy()
+            .to_string(),
+        session_titles: claude_dir
+            .join("session-titles.json")
+            .to_string_lossy()
+            .to_string(),
     })
 }
 
@@ -1335,7 +1847,8 @@ fn export_metadata_to(target_path: String) -> Result<(), String> {
     let home = dirs::home_dir().ok_or("home")?;
     let claude = home.join(".claude");
     let read_json = |p: PathBuf| -> serde_json::Value {
-        fs::read_to_string(&p).ok()
+        fs::read_to_string(&p)
+            .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or(serde_json::json!({}))
     };
@@ -1351,8 +1864,8 @@ fn export_metadata_to(target_path: String) -> Result<(), String> {
 #[tauri::command]
 fn import_metadata_from(source_path: String) -> Result<(), String> {
     let content = fs::read_to_string(&source_path).map_err(|e| e.to_string())?;
-    let data: MetadataExport = serde_json::from_str(&content)
-        .map_err(|e| format!("JSON 파싱 실패: {}", e))?;
+    let data: MetadataExport =
+        serde_json::from_str(&content).map_err(|e| format!("JSON 파싱 실패: {}", e))?;
     let home = dirs::home_dir().ok_or("home")?;
     let claude = home.join(".claude");
     fs::create_dir_all(&claude).map_err(|e| e.to_string())?;
@@ -1368,20 +1881,26 @@ fn import_metadata_from(source_path: String) -> Result<(), String> {
 #[tauri::command]
 fn clear_logs() -> Result<u32, String> {
     let dir = resolve_log_dir()?;
-    if !dir.exists() { return Ok(0); }
+    if !dir.exists() {
+        return Ok(0);
+    }
     let mut count = 0u32;
     for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
         if path.is_file() && path.extension().map(|e| e == "log").unwrap_or(false) {
-            if fs::remove_file(&path).is_ok() { count += 1; }
+            if fs::remove_file(&path).is_ok() {
+                count += 1;
+            }
         }
     }
     Ok(count)
 }
 
 #[tauri::command]
-fn get_claude_verbose() -> bool { load_config().claude_verbose.unwrap_or(false) }
+fn get_claude_verbose() -> bool {
+    load_config().claude_verbose.unwrap_or(false)
+}
 
 #[tauri::command]
 fn set_claude_verbose(value: bool) -> Result<(), String> {
@@ -1391,7 +1910,9 @@ fn set_claude_verbose(value: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_skip_permissions() -> bool { load_config().skip_permissions.unwrap_or(true) }
+fn get_skip_permissions() -> bool {
+    load_config().skip_permissions.unwrap_or(true)
+}
 
 #[tauri::command]
 fn set_skip_permissions(value: bool) -> Result<(), String> {
@@ -1401,7 +1922,9 @@ fn set_skip_permissions(value: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_restore_sessions() -> bool { load_config().restore_sessions.unwrap_or(true) }
+fn get_restore_sessions() -> bool {
+    load_config().restore_sessions.unwrap_or(true)
+}
 
 #[tauri::command]
 fn set_restore_sessions(value: bool) -> Result<(), String> {
@@ -1411,7 +1934,9 @@ fn set_restore_sessions(value: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_show_oneshot() -> bool { load_config().show_oneshot.unwrap_or(false) }
+fn get_show_oneshot() -> bool {
+    load_config().show_oneshot.unwrap_or(false)
+}
 
 #[tauri::command]
 fn set_show_oneshot(value: bool) -> Result<(), String> {
@@ -1432,11 +1957,17 @@ fn open_path_in_os(path: String) -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg(&path).spawn().map_err(|e| e.to_string())?;
+        std::process::Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        std::process::Command::new("xdg-open").arg(&path).spawn().map_err(|e| e.to_string())?;
+        std::process::Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
     }
     let _ = path;
     Ok(())
@@ -1513,11 +2044,17 @@ struct JsonlUsage {
 
 fn normalize_model(m: &Option<String>) -> Option<String> {
     let s = m.as_deref()?.to_lowercase();
-    if s.contains("sonnet") { Some("sonnet".into()) }
-    else if s.contains("opus") { Some("opus".into()) }
-    else if s.contains("haiku") { Some("haiku".into()) }
-    else if s.contains("fable") { Some("fable".into()) }
-    else { None }
+    if s.contains("sonnet") {
+        Some("sonnet".into())
+    } else if s.contains("opus") {
+        Some("opus".into())
+    } else if s.contains("haiku") {
+        Some("haiku".into())
+    } else if s.contains("fable") {
+        Some("fable".into())
+    } else {
+        None
+    }
 }
 
 fn aggregate_usage(active_session_id: Option<&str>) -> Result<UsageReport, String> {
@@ -1536,21 +2073,34 @@ fn aggregate_usage(active_session_id: Option<&str>) -> Result<UsageReport, Strin
     let mut active_session: Option<SessionUsage> = None;
 
     for (_account, projects) in all_projects_dirs() {
-        let Ok(entries) = fs::read_dir(&projects) else { continue };
+        let Ok(entries) = fs::read_dir(&projects) else {
+            continue;
+        };
         for proj in entries.flatten() {
             let proj_path = proj.path();
-            if !proj_path.is_dir() { continue; }
-            let Ok(files) = fs::read_dir(&proj_path) else { continue };
+            if !proj_path.is_dir() {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(&proj_path) else {
+                continue;
+            };
             for f in files.flatten() {
                 let fp = f.path();
-                if !fp.is_file() { continue; }
-                if fp.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+                if !fp.is_file() {
+                    continue;
+                }
+                if fp.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
 
-                let session_id = fp.file_stem()
+                let session_id = fp
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_string();
-                let Ok(content) = fs::read_to_string(&fp) else { continue };
+                let Ok(content) = fs::read_to_string(&fp) else {
+                    continue;
+                };
 
                 let mut s_totals = UsageTotals::default();
                 let mut s_first: Option<chrono::DateTime<Local>> = None;
@@ -1558,20 +2108,32 @@ fn aggregate_usage(active_session_id: Option<&str>) -> Result<UsageReport, Strin
                 let mut s_model: Option<String> = None;
 
                 for line in content.lines() {
-                    if line.trim().is_empty() { continue; }
-                    let Ok(entry) = serde_json::from_str::<JsonlEntry>(line) else { continue };
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let Ok(entry) = serde_json::from_str::<JsonlEntry>(line) else {
+                        continue;
+                    };
                     let Some(msg) = entry.message else { continue };
                     let Some(usage) = msg.usage else { continue };
                     let model = normalize_model(&msg.model);
-                    let ts = entry.timestamp.as_deref()
+                    let ts = entry
+                        .timestamp
+                        .as_deref()
                         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                         .map(|d| d.with_timezone(&Local));
 
                     all_time.add(&usage);
                     s_totals.add(&usage);
-                    if s_first.is_none() { s_first = ts; }
-                    if ts.is_some() { s_last = ts; }
-                    if model.is_some() { s_model = model.clone(); }
+                    if s_first.is_none() {
+                        s_first = ts;
+                    }
+                    if ts.is_some() {
+                        s_last = ts;
+                    }
+                    if model.is_some() {
+                        s_model = model.clone();
+                    }
 
                     if let Some(t) = ts {
                         if t >= week_start {
@@ -1607,7 +2169,14 @@ fn aggregate_usage(active_session_id: Option<&str>) -> Result<UsageReport, Strin
         }
     }
 
-    Ok(UsageReport { today, week, all_time, by_model_today, by_model_week, active_session })
+    Ok(UsageReport {
+        today,
+        week,
+        all_time,
+        by_model_today,
+        by_model_week,
+        active_session,
+    })
 }
 
 #[derive(Default)]
@@ -1624,15 +2193,21 @@ fn get_usage_report() -> Result<UsageReport, String> {
 
 #[tauri::command]
 fn get_cached_oauth_usage(usage_state: State<'_, Arc<UsageState>>) -> Result<OauthUsage, String> {
-    usage_state.cached_oauth.lock()
+    usage_state
+        .cached_oauth
+        .lock()
         .ok()
         .and_then(|c| c.clone())
         .ok_or_else(|| "캐시 없음".into())
 }
 
 #[tauri::command]
-fn get_cached_oauth_usages_per_account(usage_state: State<'_, Arc<UsageState>>) -> Result<Vec<AccountOauthUsage>, String> {
-    let cache = usage_state.cached_oauth_multi.lock()
+fn get_cached_oauth_usages_per_account(
+    usage_state: State<'_, Arc<UsageState>>,
+) -> Result<Vec<AccountOauthUsage>, String> {
+    let cache = usage_state
+        .cached_oauth_multi
+        .lock()
         .map_err(|_| "lock 실패".to_string())?
         .clone();
     let accounts = load_accounts();
@@ -1663,21 +2238,36 @@ fn get_cached_oauth_usages_per_account(usage_state: State<'_, Arc<UsageState>>) 
 // knows which timestamp to pass. Returns None until a new file appears.
 #[tauri::command]
 fn find_new_session_since(since_ms: i64) -> Result<Option<String>, String> {
-    let threshold = std::time::UNIX_EPOCH + std::time::Duration::from_millis(since_ms.max(0) as u64);
+    let threshold =
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(since_ms.max(0) as u64);
     let mut best: Option<(std::time::SystemTime, String)> = None;
     for (_account, projects) in all_projects_dirs() {
-        let Ok(entries) = fs::read_dir(&projects) else { continue };
+        let Ok(entries) = fs::read_dir(&projects) else {
+            continue;
+        };
         for proj in entries.flatten() {
             let pp = proj.path();
-            if !pp.is_dir() { continue; }
-            let Ok(files) = fs::read_dir(&pp) else { continue };
+            if !pp.is_dir() {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(&pp) else {
+                continue;
+            };
             for f in files.flatten() {
                 let fp = f.path();
-                if fp.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
-                let Ok(meta) = fs::metadata(&fp) else { continue };
+                if fp.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let Ok(meta) = fs::metadata(&fp) else {
+                    continue;
+                };
                 let Ok(mtime) = meta.modified() else { continue };
-                if mtime < threshold { continue; }
-                let Some(sid) = fp.file_stem().and_then(|s| s.to_str()).map(String::from) else { continue };
+                if mtime < threshold {
+                    continue;
+                }
+                let Some(sid) = fp.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+                    continue;
+                };
                 if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
                     best = Some((mtime, sid));
                 }
@@ -1691,47 +2281,67 @@ fn find_new_session_since(since_ms: i64) -> Result<Option<String>, String> {
 fn get_session_usage(session_id: String) -> Result<Option<SessionUsage>, String> {
     use chrono::Local;
     for (_account, projects) in all_projects_dirs() {
-    let Ok(proj_entries) = fs::read_dir(&projects) else { continue };
-    for proj in proj_entries.flatten() {
-        let p = proj.path();
-        if !p.is_dir() { continue; }
-        let file = p.join(format!("{}.jsonl", session_id));
-        if !file.is_file() { continue; }
-        let Ok(content) = fs::read_to_string(&file) else { return Ok(None) };
-
-        let mut totals = UsageTotals::default();
-        let mut first: Option<chrono::DateTime<Local>> = None;
-        let mut last: Option<chrono::DateTime<Local>> = None;
-        let mut model: Option<String> = None;
-
-        for line in content.lines() {
-            if line.trim().is_empty() { continue; }
-            let Ok(entry) = serde_json::from_str::<JsonlEntry>(line) else { continue };
-            let Some(msg) = entry.message else { continue };
-            let Some(usage) = msg.usage else { continue };
-            let m = normalize_model(&msg.model);
-            let ts = entry.timestamp.as_deref()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|d| d.with_timezone(&Local));
-            totals.add(&usage);
-            if first.is_none() { first = ts; }
-            if ts.is_some() { last = ts; }
-            if m.is_some() { model = m.clone(); }
-        }
-
-        let duration_min = match (first, last) {
-            (Some(a), Some(b)) => (b - a).num_minutes().max(0) as u32,
-            _ => 0,
+        let Ok(proj_entries) = fs::read_dir(&projects) else {
+            continue;
         };
-        return Ok(Some(SessionUsage {
-            session_id,
-            model,
-            totals,
-            duration_min,
-            first_ts: first.map(|t| t.to_rfc3339()),
-            last_ts: last.map(|t| t.to_rfc3339()),
-        }));
-    }
+        for proj in proj_entries.flatten() {
+            let p = proj.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let file = p.join(format!("{}.jsonl", session_id));
+            if !file.is_file() {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&file) else {
+                return Ok(None);
+            };
+
+            let mut totals = UsageTotals::default();
+            let mut first: Option<chrono::DateTime<Local>> = None;
+            let mut last: Option<chrono::DateTime<Local>> = None;
+            let mut model: Option<String> = None;
+
+            for line in content.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_str::<JsonlEntry>(line) else {
+                    continue;
+                };
+                let Some(msg) = entry.message else { continue };
+                let Some(usage) = msg.usage else { continue };
+                let m = normalize_model(&msg.model);
+                let ts = entry
+                    .timestamp
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|d| d.with_timezone(&Local));
+                totals.add(&usage);
+                if first.is_none() {
+                    first = ts;
+                }
+                if ts.is_some() {
+                    last = ts;
+                }
+                if m.is_some() {
+                    model = m.clone();
+                }
+            }
+
+            let duration_min = match (first, last) {
+                (Some(a), Some(b)) => (b - a).num_minutes().max(0) as u32,
+                _ => 0,
+            };
+            return Ok(Some(SessionUsage {
+                session_id,
+                model,
+                totals,
+                duration_min,
+                first_ts: first.map(|t| t.to_rfc3339()),
+                last_ts: last.map(|t| t.to_rfc3339()),
+            }));
+        }
     }
     Ok(None)
 }
@@ -1811,14 +2421,20 @@ impl ApiOauthUsage {
             utilization: l.percent.unwrap_or(0.0),
             resets_at: l.resets_at.clone(),
         };
-        let five_hour = self.five_hour.clone()
+        let five_hour = self
+            .five_hour
+            .clone()
             .or_else(|| self.limit("session").map(from_limit))
             .ok_or("응답에 5시간(session) 한도 없음 — API 스키마 변경 가능")?;
-        let seven_day = self.seven_day.clone()
+        let seven_day = self
+            .seven_day
+            .clone()
             .or_else(|| self.limit("weekly_all").map(from_limit))
             .ok_or("응답에 주간(weekly_all) 한도 없음 — API 스키마 변경 가능")?;
         let seven_day_scoped = self.limit("weekly_scoped").map(|l| ScopedQuota {
-            label: l.scope.as_ref()
+            label: l
+                .scope
+                .as_ref()
                 .and_then(|s| s.model.as_ref())
                 .and_then(|m| m.display_name.clone()),
             utilization: l.percent.unwrap_or(0.0),
@@ -1849,22 +2465,31 @@ fn load_oauth_cache_from_disk() -> Option<OauthUsage> {
 
 fn save_oauth_cache_to_disk(data: &OauthUsage) {
     let Some(p) = oauth_cache_path() else { return };
-    if let Some(parent) = p.parent() { let _ = fs::create_dir_all(parent); }
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
     if let Ok(json) = serde_json::to_string(data) {
         let _ = fs::write(&p, json);
     }
 }
 
 fn load_oauth_cache_multi_from_disk() -> HashMap<String, OauthUsage> {
-    let Some(p) = oauth_cache_multi_path() else { return HashMap::new(); };
-    fs::read_to_string(&p).ok()
+    let Some(p) = oauth_cache_multi_path() else {
+        return HashMap::new();
+    };
+    fs::read_to_string(&p)
+        .ok()
         .and_then(|s| serde_json::from_str::<HashMap<String, OauthUsage>>(&s).ok())
         .unwrap_or_default()
 }
 
 fn save_oauth_cache_multi_to_disk(data: &HashMap<String, OauthUsage>) {
-    let Some(p) = oauth_cache_multi_path() else { return };
-    if let Some(parent) = p.parent() { let _ = fs::create_dir_all(parent); }
+    let Some(p) = oauth_cache_multi_path() else {
+        return;
+    };
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
     if let Ok(json) = serde_json::to_string(data) {
         let _ = fs::write(&p, json);
     }
@@ -1904,7 +2529,10 @@ async fn fetch_oauth_usage_for_account(account: &Account) -> Result<OauthUsage, 
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("API {}: {}", status, body));
     }
-    let raw = resp.json::<ApiOauthUsage>().await.map_err(|e| format!("JSON 파싱 실패: {}", e))?;
+    let raw = resp
+        .json::<ApiOauthUsage>()
+        .await
+        .map_err(|e| format!("JSON 파싱 실패: {}", e))?;
     raw.into_usage()
 }
 
@@ -1922,7 +2550,10 @@ pub struct AccountOauthUsage {
 
 #[tauri::command]
 async fn get_oauth_usage() -> Result<OauthUsage, String> {
-    let acc = load_accounts().into_iter().next().unwrap_or_else(default_account);
+    let acc = load_accounts()
+        .into_iter()
+        .next()
+        .unwrap_or_else(default_account);
     fetch_oauth_usage_for_account(&acc).await
 }
 
@@ -1961,7 +2592,9 @@ fn favorites_path() -> Result<PathBuf, String> {
 #[tauri::command]
 fn get_favorite_sessions() -> Result<Vec<String>, String> {
     let p = favorites_path()?;
-    if !p.exists() { return Ok(vec![]); }
+    if !p.exists() {
+        return Ok(vec![]);
+    }
     let content = fs::read_to_string(&p).map_err(|e| e.to_string())?;
     serde_json::from_str(&content).map_err(|e| e.to_string())
 }
@@ -1970,12 +2603,16 @@ fn get_favorite_sessions() -> Result<Vec<String>, String> {
 fn set_session_favorite(session_id: String, favorite: bool) -> Result<Vec<String>, String> {
     let mut list = get_favorite_sessions().unwrap_or_default();
     if favorite {
-        if !list.contains(&session_id) { list.push(session_id); }
+        if !list.contains(&session_id) {
+            list.push(session_id);
+        }
     } else {
         list.retain(|s| s != &session_id);
     }
     let p = favorites_path()?;
-    if let Some(parent) = p.parent() { let _ = fs::create_dir_all(parent); }
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
     let json = serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?;
     fs::write(&p, json).map_err(|e| e.to_string())?;
     Ok(list)
@@ -2024,8 +2661,12 @@ fn default_account() -> Account {
 }
 
 fn load_accounts() -> Vec<Account> {
-    let Ok(p) = accounts_path() else { return vec![default_account()]; };
-    if !p.exists() { return vec![default_account()]; }
+    let Ok(p) = accounts_path() else {
+        return vec![default_account()];
+    };
+    if !p.exists() {
+        return vec![default_account()];
+    }
     let mut list: Vec<Account> = fs::read_to_string(&p)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -2038,7 +2679,9 @@ fn load_accounts() -> Vec<Account> {
 
 fn save_accounts(list: &[Account]) -> Result<(), String> {
     let p = accounts_path()?;
-    if let Some(parent) = p.parent() { let _ = fs::create_dir_all(parent); }
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
     let json = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
     fs::write(&p, json).map_err(|e| e.to_string())
 }
@@ -2047,7 +2690,9 @@ fn save_accounts(list: &[Account]) -> Result<(), String> {
 // config_dir (uses ~/.claude). Other accounts default to ~/.claude-accounts/{name}
 // if their stored config_dir is empty.
 fn account_config_dir(account: &Account) -> Option<PathBuf> {
-    if account.name == DEFAULT_ACCOUNT_NAME { return None; }
+    if account.name == DEFAULT_ACCOUNT_NAME {
+        return None;
+    }
     if let Some(s) = account.config_dir.as_ref().filter(|s| !s.trim().is_empty()) {
         return Some(PathBuf::from(s));
     }
@@ -2081,10 +2726,18 @@ fn get_accounts() -> Result<Vec<Account>, String> {
 }
 
 #[tauri::command]
-fn add_account(name: String, alias: Option<String>, config_dir: Option<String>) -> Result<Vec<Account>, String> {
+fn add_account(
+    name: String,
+    alias: Option<String>,
+    config_dir: Option<String>,
+) -> Result<Vec<Account>, String> {
     let name = name.trim().to_string();
-    if name.is_empty() { return Err("계정 이름이 비어있음".into()); }
-    if name == DEFAULT_ACCOUNT_NAME { return Err("기본 계정 이름은 예약됨".into()); }
+    if name.is_empty() {
+        return Err("계정 이름이 비어있음".into());
+    }
+    if name == DEFAULT_ACCOUNT_NAME {
+        return Err("기본 계정 이름은 예약됨".into());
+    }
     let mut list = load_accounts();
     if list.iter().any(|a| a.name == name) {
         return Err(format!("이미 존재하는 계정: {}", name));
@@ -2109,7 +2762,9 @@ fn add_account(name: String, alias: Option<String>, config_dir: Option<String>) 
 
 #[tauri::command]
 fn remove_account(name: String) -> Result<Vec<Account>, String> {
-    if name == DEFAULT_ACCOUNT_NAME { return Err("기본 계정은 삭제 불가".into()); }
+    if name == DEFAULT_ACCOUNT_NAME {
+        return Err("기본 계정은 삭제 불가".into());
+    }
     let mut list = load_accounts();
     list.retain(|a| a.name != name);
     save_accounts(&list)?;
@@ -2146,54 +2801,78 @@ fn session_account_map_path() -> Result<PathBuf, String> {
 }
 
 fn load_label_account_map() -> HashMap<String, String> {
-    label_account_map_path().ok()
+    label_account_map_path()
+        .ok()
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 fn save_label_account_map(m: &HashMap<String, String>) -> Result<(), String> {
     let p = label_account_map_path()?;
-    if let Some(parent) = p.parent() { let _ = fs::create_dir_all(parent); }
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
     let json = serde_json::to_string_pretty(m).map_err(|e| e.to_string())?;
     fs::write(p, json).map_err(|e| e.to_string())
 }
 
 fn load_session_account_map() -> HashMap<String, String> {
-    session_account_map_path().ok()
+    session_account_map_path()
+        .ok()
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 fn save_session_account_map(m: &HashMap<String, String>) -> Result<(), String> {
     let p = session_account_map_path()?;
-    if let Some(parent) = p.parent() { let _ = fs::create_dir_all(parent); }
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
     let json = serde_json::to_string_pretty(m).map_err(|e| e.to_string())?;
     fs::write(p, json).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn get_label_account_map() -> HashMap<String, String> { load_label_account_map() }
+fn get_label_account_map() -> HashMap<String, String> {
+    load_label_account_map()
+}
 
 #[tauri::command]
-fn set_label_account_mapping(label: String, account: Option<String>) -> Result<HashMap<String, String>, String> {
+fn set_label_account_mapping(
+    label: String,
+    account: Option<String>,
+) -> Result<HashMap<String, String>, String> {
     let mut m = load_label_account_map();
     match account.filter(|s| !s.trim().is_empty()) {
-        Some(a) => { m.insert(label, a); }
-        None => { m.remove(&label); }
+        Some(a) => {
+            m.insert(label, a);
+        }
+        None => {
+            m.remove(&label);
+        }
     }
     save_label_account_map(&m)?;
     Ok(m)
 }
 
 #[tauri::command]
-fn get_session_account_map() -> HashMap<String, String> { load_session_account_map() }
+fn get_session_account_map() -> HashMap<String, String> {
+    load_session_account_map()
+}
 
 #[tauri::command]
-fn set_session_account_mapping(session_id: String, account: Option<String>) -> Result<HashMap<String, String>, String> {
+fn set_session_account_mapping(
+    session_id: String,
+    account: Option<String>,
+) -> Result<HashMap<String, String>, String> {
     let mut m = load_session_account_map();
     match account.filter(|s| !s.trim().is_empty()) {
-        Some(a) => { m.insert(session_id, a); }
-        None => { m.remove(&session_id); }
+        Some(a) => {
+            m.insert(session_id, a);
+        }
+        None => {
+            m.remove(&session_id);
+        }
     }
     save_session_account_map(&m)?;
     Ok(m)
@@ -2207,17 +2886,20 @@ fn resolve_account_name(
     labels: &[String],
     accounts: &[Account],
 ) -> String {
-    let known: std::collections::HashSet<&str> =
-        accounts.iter().map(|a| a.name.as_str()).collect();
+    let known: std::collections::HashSet<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
     if let Some(sid) = session_id {
         if let Some(name) = load_session_account_map().get(sid) {
-            if known.contains(name.as_str()) { return name.clone(); }
+            if known.contains(name.as_str()) {
+                return name.clone();
+            }
         }
     }
     let lmap = load_label_account_map();
     for l in labels {
         if let Some(name) = lmap.get(l) {
-            if known.contains(name.as_str()) { return name.clone(); }
+            if known.contains(name.as_str()) {
+                return name.clone();
+            }
         }
     }
     DEFAULT_ACCOUNT_NAME.to_string()
@@ -2225,7 +2907,11 @@ fn resolve_account_name(
 
 // Look up a session_id's labels by scanning the labels file. Cheap (HashMap).
 fn labels_for_session(session_id: &str) -> Vec<String> {
-    load_labels().labels.get(session_id).cloned().unwrap_or_default()
+    load_labels()
+        .labels
+        .get(session_id)
+        .cloned()
+        .unwrap_or_default()
 }
 
 // --- `claude auth status` integration ---
@@ -2255,7 +2941,9 @@ fn run_claude_auth_status(config_dir: Option<&Path>) -> Result<AccountAuthInfo, 
     {
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    let output = cmd.output().map_err(|e| format!("claude auth status 실행 실패: {}", e))?;
+    let output = cmd
+        .output()
+        .map_err(|e| format!("claude auth status 실행 실패: {}", e))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Output looks like: "Not logged in · Please run /login" when no credentials.
     let v: serde_json::Value = match serde_json::from_str(&stdout) {
@@ -2272,7 +2960,10 @@ fn run_claude_auth_status(config_dir: Option<&Path>) -> Result<AccountAuthInfo, 
     Ok(AccountAuthInfo {
         logged_in: v.get("loggedIn").and_then(|x| x.as_bool()).unwrap_or(false),
         email: v.get("email").and_then(|x| x.as_str()).map(String::from),
-        subscription: v.get("subscriptionType").and_then(|x| x.as_str()).map(String::from),
+        subscription: v
+            .get("subscriptionType")
+            .and_then(|x| x.as_str())
+            .map(String::from),
         org_name: v.get("orgName").and_then(|x| x.as_str()).map(String::from),
     })
 }
@@ -2280,7 +2971,10 @@ fn run_claude_auth_status(config_dir: Option<&Path>) -> Result<AccountAuthInfo, 
 #[tauri::command]
 fn refresh_account_info(name: String) -> Result<Vec<Account>, String> {
     let mut list = load_accounts();
-    let dir_opt = list.iter().find(|a| a.name == name).and_then(|a| account_config_dir(a));
+    let dir_opt = list
+        .iter()
+        .find(|a| a.name == name)
+        .and_then(|a| account_config_dir(a));
     let info = run_claude_auth_status(dir_opt.as_deref())?;
     if let Some(acc) = list.iter_mut().find(|a| a.name == name) {
         acc.logged_in = info.logged_in;
@@ -2317,14 +3011,21 @@ async fn open_login_session_for_account(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let accounts = load_accounts();
-    let acc = accounts.iter().find(|a| a.name == account_name)
+    let acc = accounts
+        .iter()
+        .find(|a| a.name == account_name)
         .ok_or_else(|| format!("계정 없음: {}", account_name))?;
     let dir = account_config_dir(acc);
-    if let Some(d) = dir.as_ref() { let _ = fs::create_dir_all(d); }
+    if let Some(d) = dir.as_ref() {
+        let _ = fs::create_dir_all(d);
+    }
 
     let mut env = HashMap::new();
     if let Some(d) = dir.as_ref() {
-        env.insert("CLAUDE_CONFIG_DIR".to_string(), d.to_string_lossy().to_string());
+        env.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            d.to_string_lossy().to_string(),
+        );
     }
 
     let terminal_id = Uuid::new_v4().to_string();
@@ -2340,28 +3041,40 @@ async fn open_login_session_for_account(
     };
 
     let label = format!("term-{}", Uuid::new_v4().simple());
-    state.pending_tabs.lock().unwrap().insert(label.clone(), payload);
+    state
+        .pending_tabs
+        .lock()
+        .unwrap()
+        .insert(label.clone(), payload);
     WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
         .title(format!("Claude 로그인 — {}", account_name))
         .inner_size(900.0, 600.0)
         .min_inner_size(640.0, 400.0)
         .resizable(true)
         .disable_drag_drop_handler()
-        .build().map_err(|e| e.to_string())?;
+        .build()
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 fn main() {
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("Failed to create tokio runtime");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
 
     let usage_state = Arc::new(UsageState::default());
     // Hydrate oauth cache from disk so windows opened before first poll still see data.
     if let Some(disk) = load_oauth_cache_from_disk() {
-        if let Ok(mut c) = usage_state.cached_oauth.lock() { *c = Some(disk); }
+        if let Ok(mut c) = usage_state.cached_oauth.lock() {
+            *c = Some(disk);
+        }
     }
     let disk_multi = load_oauth_cache_multi_from_disk();
     if !disk_multi.is_empty() {
-        if let Ok(mut c) = usage_state.cached_oauth_multi.lock() { *c = disk_multi; }
+        if let Ok(mut c) = usage_state.cached_oauth_multi.lock() {
+            *c = disk_multi;
+        }
     }
 
     tauri::Builder::default()
@@ -2375,6 +3088,7 @@ fn main() {
             ptys: Mutex::new(HashMap::new()),
             pending_tabs: Mutex::new(HashMap::new()),
             open_sessions: Mutex::new(Vec::new()),
+            exited_terminals: Mutex::new(std::collections::HashSet::new()),
             restore_pending: Mutex::new(Some({
                 // Take last run's list and start this run from an empty one.
                 let prev = load_open_sessions();
@@ -2393,7 +3107,9 @@ fn main() {
                 tauri::async_runtime::spawn(async move {
                     loop {
                         tokio::time::sleep(Duration::from_secs(3)).await;
-                        let Ok(report) = aggregate_usage(None) else { continue };
+                        let Ok(report) = aggregate_usage(None) else {
+                            continue;
+                        };
                         let sig = report.today.total();
                         let mut last = state.last_signature.lock().unwrap();
                         if last.as_ref() != Some(&sig) {
@@ -2430,7 +3146,8 @@ fn main() {
                         }
 
                         let accounts = load_accounts();
-                        let mut per_account: Vec<AccountOauthUsage> = Vec::with_capacity(accounts.len());
+                        let mut per_account: Vec<AccountOauthUsage> =
+                            Vec::with_capacity(accounts.len());
                         let mut cache_map: HashMap<String, OauthUsage> = HashMap::new();
                         let mut default_for_legacy: Option<OauthUsage> = None;
                         for acc in &accounts {
@@ -2456,10 +3173,14 @@ fn main() {
                                 error,
                             });
                         }
-                        if let Ok(mut c) = oauth_state.cached_oauth_multi.lock() { *c = cache_map.clone(); }
+                        if let Ok(mut c) = oauth_state.cached_oauth_multi.lock() {
+                            *c = cache_map.clone();
+                        }
                         save_oauth_cache_multi_to_disk(&cache_map);
                         if let Some(d) = default_for_legacy {
-                            if let Ok(mut c) = oauth_state.cached_oauth.lock() { *c = Some(d.clone()); }
+                            if let Ok(mut c) = oauth_state.cached_oauth.lock() {
+                                *c = Some(d.clone());
+                            }
                             save_oauth_cache_to_disk(&d);
                             let _ = handle2.emit("usage-oauth-update", &d);
                         }
@@ -2471,29 +3192,63 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            get_sessions, get_projects,
-            get_project_labels, set_project_label,
-            set_labels, set_session_title,
-            delete_session, delete_project_sessions,
+            get_sessions,
+            get_projects,
+            get_project_labels,
+            set_project_label,
+            set_labels,
+            set_session_title,
+            delete_session,
+            delete_project_sessions,
             open_session,
-            pty_spawn, pty_write, pty_resize, pty_kill_many, pty_take_pending,
+            pty_spawn,
+            pty_write,
+            pty_resize,
+            pty_kill_many,
+            pty_take_pending,
             toggle_devtools,
-            drop_tab, spawn_terminal,
-            get_terminal_theme, set_terminal_theme,
-            get_log_dir, set_log_dir, clear_logs,
-            get_claude_verbose, set_claude_verbose,
-            get_skip_permissions, set_skip_permissions,
-            get_show_oneshot, set_show_oneshot,
-            get_restore_sessions, set_restore_sessions, take_restore_sessions,
+            drop_tab,
+            spawn_terminal,
+            get_terminal_theme,
+            set_terminal_theme,
+            get_log_dir,
+            set_log_dir,
+            clear_logs,
+            get_claude_verbose,
+            set_claude_verbose,
+            get_skip_permissions,
+            set_skip_permissions,
+            get_show_oneshot,
+            set_show_oneshot,
+            get_restore_sessions,
+            set_restore_sessions,
+            take_restore_sessions,
+            get_open_sessions,
+            session_id_for_terminal,
             open_path_in_os,
-            get_metadata_paths, export_metadata_to, import_metadata_from,
-            get_usage_report, get_session_usage, find_new_session_since, get_oauth_usage, get_cached_oauth_usage,
-            get_oauth_usages_per_account, get_cached_oauth_usages_per_account,
-            get_favorite_sessions, set_session_favorite,
-            get_accounts, add_account, remove_account, set_account_alias,
-            get_label_account_map, set_label_account_mapping,
-            get_session_account_map, set_session_account_mapping,
-            refresh_account_info, refresh_all_accounts, open_login_session_for_account
+            get_metadata_paths,
+            export_metadata_to,
+            import_metadata_from,
+            get_usage_report,
+            get_session_usage,
+            find_new_session_since,
+            get_oauth_usage,
+            get_cached_oauth_usage,
+            get_oauth_usages_per_account,
+            get_cached_oauth_usages_per_account,
+            get_favorite_sessions,
+            set_session_favorite,
+            get_accounts,
+            add_account,
+            remove_account,
+            set_account_alias,
+            get_label_account_map,
+            set_label_account_mapping,
+            get_session_account_map,
+            set_session_account_mapping,
+            refresh_account_info,
+            refresh_all_accounts,
+            open_login_session_for_account
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -2502,7 +3257,9 @@ fn main() {
         // dies, so any PTY still registered here would be orphaned on exit.
         .run(|app, event| {
             if let RunEvent::Exit = event {
-                let Some(state) = app.try_state::<AppState>() else { return };
+                let Some(state) = app.try_state::<AppState>() else {
+                    return;
+                };
                 // Drain first, then kill outside the lock. This runs on the main
                 // thread during shutdown, which is only acceptable because
                 // kill_pty_tree merely spawns taskkill (~10ms) instead of
@@ -2511,7 +3268,9 @@ fn main() {
                     Ok(mut m) => m.drain().map(|(_, v)| v).collect(),
                     Err(_) => return,
                 };
-                for pty in &leftover { kill_pty_tree(pty); }
+                for pty in &leftover {
+                    kill_pty_tree(pty);
+                }
             }
         });
 }
@@ -2523,9 +3282,18 @@ mod tests {
     #[test]
     fn split_session_args_extracts_id_and_keeps_the_rest() {
         let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let (sid, rest) = split_session_args(&v(&["--resume", "abc", "--model", "opus", "--dangerously-skip-permissions"]));
+        let (sid, rest) = split_session_args(&v(&[
+            "--resume",
+            "abc",
+            "--model",
+            "opus",
+            "--dangerously-skip-permissions",
+        ]));
         assert_eq!(sid.as_deref(), Some("abc"));
-        assert_eq!(rest, v(&["--model", "opus", "--dangerously-skip-permissions"]));
+        assert_eq!(
+            rest,
+            v(&["--model", "opus", "--dangerously-skip-permissions"])
+        );
         let (sid, rest) = split_session_args(&v(&["--session-id", "xyz"]));
         assert_eq!(sid.as_deref(), Some("xyz"));
         assert!(rest.is_empty());
@@ -2533,13 +3301,42 @@ mod tests {
     }
 
     #[test]
+    fn ai_title_is_the_last_record_in_the_file() {
+        let dir = std::env::temp_dir().join(format!("scsm-aititle-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        let body = [
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"ai-title","aiTitle":"첫 제목","sessionId":"s"}"#,
+            r#"{"type":"assistant"}"#,
+            r#"{"type":"ai-title","aiTitle":"바뀐 제목","sessionId":"s"}"#,
+            r#"{"type":"assistant"}"#,
+        ]
+        .join("
+");
+        fs::write(&p, body).unwrap();
+        assert_eq!(extract_ai_title(&p).as_deref(), Some("바뀐 제목"));
+        fs::write(&p, r#"{"type":"user"}"#).unwrap();
+        assert_eq!(extract_ai_title(&p), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn restore_skips_sessions_without_a_jsonl() {
         let root = std::env::temp_dir().join(format!("scsm-restore-{}", std::process::id()));
         let proj = root.join("projects").join("D--work");
         fs::create_dir_all(&proj).unwrap();
-        fs::write(proj.join("used.jsonl"), "{}
-").unwrap();
-        let env: HashMap<String, String> = [("CLAUDE_CONFIG_DIR".to_string(), root.to_string_lossy().to_string())].into();
+        fs::write(
+            proj.join("used.jsonl"),
+            "{}
+",
+        )
+        .unwrap();
+        let env: HashMap<String, String> = [(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            root.to_string_lossy().to_string(),
+        )]
+        .into();
         assert!(session_jsonl_exists("used", &env));
         assert!(!session_jsonl_exists("never-messaged", &env));
         let _ = fs::remove_dir_all(&root);
@@ -2549,15 +3346,32 @@ mod tests {
     fn oneshot_detected_from_sdk_entrypoint() {
         let dir = std::env::temp_dir().join(format!("scsm-oneshot-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let write = |name: &str, body: &str| { let p = dir.join(name); fs::write(&p, body).unwrap(); p };
+        let write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            fs::write(&p, body).unwrap();
+            p
+        };
         let head = "{\"type\":\"queue-operation\"}
 ";
-        let sdk = write("sdk.jsonl", &format!("{head}{{\"type\":\"user\",\"entrypoint\":\"sdk-cli\"}}
-"));
-        let cli = write("cli.jsonl", &format!("{head}{{\"type\":\"user\",\"entrypoint\":\"cli\"}}
-"));
-        let old = write("old.jsonl", "{\"type\":\"user\"}
-");
+        let sdk = write(
+            "sdk.jsonl",
+            &format!(
+                "{head}{{\"type\":\"user\",\"entrypoint\":\"sdk-cli\"}}
+"
+            ),
+        );
+        let cli = write(
+            "cli.jsonl",
+            &format!(
+                "{head}{{\"type\":\"user\",\"entrypoint\":\"cli\"}}
+"
+            ),
+        );
+        let old = write(
+            "old.jsonl",
+            "{\"type\":\"user\"}
+",
+        );
         assert!(is_oneshot_session(&sdk));
         assert!(!is_oneshot_session(&cli));
         assert!(!is_oneshot_session(&old));
@@ -2581,7 +3395,10 @@ mod tests {
             "extra_usage": {"is_enabled": false},
             "spend": {"percent": 0}
         }"#;
-        let usage = serde_json::from_str::<ApiOauthUsage>(json).unwrap().into_usage().unwrap();
+        let usage = serde_json::from_str::<ApiOauthUsage>(json)
+            .unwrap()
+            .into_usage()
+            .unwrap();
         assert_eq!(usage.five_hour.utilization, 10.0);
         assert_eq!(usage.seven_day.utilization, 55.0);
         assert!(usage.seven_day_sonnet.is_none());
@@ -2599,7 +3416,10 @@ mod tests {
             "seven_day": {"utilization": 53.0, "resets_at": "2026-07-02T01:59:59+00:00"},
             "seven_day_sonnet": {"utilization": 7.0, "resets_at": "2026-07-02T01:59:59+00:00"}
         }"#;
-        let usage = serde_json::from_str::<ApiOauthUsage>(json).unwrap().into_usage().unwrap();
+        let usage = serde_json::from_str::<ApiOauthUsage>(json)
+            .unwrap()
+            .into_usage()
+            .unwrap();
         assert_eq!(usage.seven_day.utilization, 53.0);
         assert_eq!(usage.seven_day_sonnet.unwrap().utilization, 7.0);
         assert!(usage.seven_day_scoped.is_none());
@@ -2614,19 +3434,39 @@ mod tests {
         assert_eq!(parsed.seven_day.utilization, 53.0);
 
         let modern = OauthUsage {
-            five_hour: OauthQuota { utilization: 10.0, resets_at: None },
-            seven_day: OauthQuota { utilization: 55.0, resets_at: None },
+            five_hour: OauthQuota {
+                utilization: 10.0,
+                resets_at: None,
+            },
+            seven_day: OauthQuota {
+                utilization: 55.0,
+                resets_at: None,
+            },
             seven_day_sonnet: None,
-            seven_day_scoped: Some(ScopedQuota { label: Some("Fable".into()), utilization: 69.0, resets_at: None }),
+            seven_day_scoped: Some(ScopedQuota {
+                label: Some("Fable".into()),
+                utilization: 69.0,
+                resets_at: None,
+            }),
         };
-        let roundtrip: OauthUsage = serde_json::from_str(&serde_json::to_string(&modern).unwrap()).unwrap();
-        assert_eq!(roundtrip.seven_day_scoped.unwrap().label.as_deref(), Some("Fable"));
+        let roundtrip: OauthUsage =
+            serde_json::from_str(&serde_json::to_string(&modern).unwrap()).unwrap();
+        assert_eq!(
+            roundtrip.seven_day_scoped.unwrap().label.as_deref(),
+            Some("Fable")
+        );
     }
 
     #[test]
     fn normalize_model_recognizes_fable() {
-        assert_eq!(normalize_model(&Some("claude-fable-5".into())).as_deref(), Some("fable"));
-        assert_eq!(normalize_model(&Some("claude-sonnet-5".into())).as_deref(), Some("sonnet"));
+        assert_eq!(
+            normalize_model(&Some("claude-fable-5".into())).as_deref(),
+            Some("fable")
+        );
+        assert_eq!(
+            normalize_model(&Some("claude-sonnet-5".into())).as_deref(),
+            Some("sonnet")
+        );
         assert_eq!(normalize_model(&Some("unknown-model".into())), None);
     }
 }
