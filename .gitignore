@@ -20,3 +20,6 @@ src-tauri/gen/
 
 # Temp
 app-icon.png
+
+# Verbose 로그 (세션 화면 내용 전체라 절대 커밋 금지)
+_logs/
