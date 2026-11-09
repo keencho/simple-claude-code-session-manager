@@ -1076,6 +1076,8 @@ struct OpenSessionEntry {
     title: String,
     #[serde(default)]
     account_name: Option<String>,
+    #[serde(default)]
+    started_at: String,
 }
 
 fn open_sessions_path() -> Result<PathBuf, String> {
@@ -1135,6 +1137,11 @@ struct LiveSession {
     session_id: String,
     // false until the first message creates the jsonl (not in the sidebar yet)
     has_jsonl: bool,
+    // for the sidebar's placeholder row of a session that has no jsonl yet
+    cwd: Option<String>,
+    account_name: Option<String>,
+    custom_title: String,
+    started_at: String,
 }
 
 // Sessions whose claude is running in some tab right now, in any window.
@@ -1142,12 +1149,17 @@ struct LiveSession {
 fn get_open_sessions(state: State<AppState>) -> Vec<LiveSession> {
     let exited = state.exited_terminals.lock().unwrap().clone();
     let open = state.open_sessions.lock().unwrap().clone();
+    let titles = load_session_titles();
     let mut seen = std::collections::HashSet::new();
     open.into_iter()
         .filter(|e| !exited.contains(&e.terminal_id) && seen.insert(e.session_id.clone()))
         .map(|e| LiveSession {
             has_jsonl: session_jsonl_exists(&e.session_id, &e.env),
+            custom_title: titles.get(&e.session_id).cloned().unwrap_or_default(),
             session_id: e.session_id,
+            cwd: e.cwd,
+            account_name: e.account_name,
+            started_at: e.started_at,
         })
         .collect()
 }
@@ -1400,6 +1412,7 @@ fn pty_spawn(
         env: env.clone().unwrap_or_default(),
         title: title.unwrap_or_default(),
         account_name,
+        started_at: chrono::Utc::now().to_rfc3339(),
     };
     let pty_system = native_pty_system();
     let pair = pty_system

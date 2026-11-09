@@ -2970,3 +2970,6 @@ body.statusbar-hidden .terminal-status-bar { display: none; }
   cursor: pointer;
 }
 .stats-update:hover { text-decoration: underline; }
+
+/* 첫 메시지 전이라 아직 파일이 없는 새 세션의 임시 행 */
+.tree-session.is-pending .session-title { color: var(--text-secondary); }

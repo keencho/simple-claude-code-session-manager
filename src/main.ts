@@ -65,6 +65,9 @@ interface SessionInfo {
   account_name?: string;
   is_oneshot?: boolean;
   ai_title?: string;
+  // Placeholder for an open session whose first message hasn't been sent yet
+  // (claude only writes the jsonl then). Display only; nothing on disk.
+  is_pending?: boolean;
 }
 
 interface Account {
@@ -198,7 +201,48 @@ let openSessionIds = new Set<string>();
 let activeSessionId: string | null = null;
 let openSessionsRecheck: number | undefined;
 
-interface LiveSession { session_id: string; has_jsonl: boolean; }
+interface LiveSession {
+  session_id: string;
+  has_jsonl: boolean;
+  cwd: string | null;
+  account_name: string | null;
+  custom_title: string;
+  started_at: string;
+}
+
+let pendingSessions: SessionInfo[] = [];
+
+function normPath(p: string): string {
+  return p.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+}
+
+// Same project folder the session will land in once it has a jsonl: reuse a
+// listed session's folder for that path, else claude's own encoding.
+function projectFolderFor(cwd: string): string {
+  const n = normPath(cwd);
+  const hit = allSessions.find((s) => normPath(s.project_path) === n);
+  return hit ? hit.project_folder : cwd.replace(/[^a-zA-Z0-9]/g, "-");
+}
+
+function toPendingSession(l: LiveSession): SessionInfo {
+  const cwd = l.cwd || "";
+  const now = l.started_at || new Date().toISOString();
+  return {
+    session_id: l.session_id,
+    first_prompt: "",
+    summary: "",
+    message_count: 0,
+    created: now,
+    modified: now,
+    git_branch: "",
+    project_path: cwd,
+    project_folder: projectFolderFor(cwd),
+    labels: [],
+    custom_title: l.custom_title || "",
+    account_name: l.account_name || DEFAULT_ACCOUNT_NAME,
+    is_pending: true,
+  };
+}
 
 async function refreshOpenSessions() {
   let live: LiveSession[] = [];
@@ -214,7 +258,9 @@ async function refreshOpenSessions() {
   // A new session shows up in the list once its first message creates the
   // jsonl; keep checking until every open session is listed.
   if (live.some((l) => l.has_jsonl && !known.has(l.session_id))) await loadSessions();
-  else renderTree();
+  const listed = new Set(allSessions.map((s) => s.session_id));
+  pendingSessions = live.filter((l) => l.cwd && !listed.has(l.session_id)).map(toPendingSession);
+  renderTree();
   void syncAutoTitles();
   window.clearTimeout(openSessionsRecheck);
   if (live.some((l) => !l.has_jsonl)) {
@@ -254,7 +300,8 @@ function markActiveSessionRow() {
 
 // `claude -p` / SDK sessions are hidden unless the toggle is on.
 function visibleSessions(): SessionInfo[] {
-  return showOneshot ? allSessions : allSessions.filter((s) => !s.is_oneshot);
+  const base = showOneshot ? allSessions : allSessions.filter((s) => !s.is_oneshot);
+  return pendingSessions.length ? [...base, ...pendingSessions] : base;
 }
 
 // --- Sidebar layout prefs (localStorage) ---
@@ -1159,7 +1206,8 @@ async function openClaudeHere(newWindow: boolean, account?: string) {
 }
 
 async function editSessionTitle(sessionId: string) {
-  const s = allSessions.find((x) => x.session_id === sessionId);
+  const s = allSessions.find((x) => x.session_id === sessionId)
+    ?? pendingSessions.find((x) => x.session_id === sessionId);
   const current = s?.custom_title || "";
   const title = await customPrompt("커스텀 제목 (비우면 삭제):", current);
   if (title === null) return;
@@ -1308,7 +1356,7 @@ async function deleteProjectSessions(folder: string, path: string) {
 // --- Render ---
 
 function renderSessionRow(s: SessionInfo, showPathHint = false): string {
-  const title = s.custom_title || s.ai_title || s.first_prompt?.trim() || "(내용 없음)";
+  const title = s.custom_title || s.ai_title || s.first_prompt?.trim() || (s.is_pending ? "새 세션 (대화 전)" : "(내용 없음)");
   const titleTip = s.custom_title
     ? ` title="직접 붙인 이름"`
     : s.ai_title ? ` title="자동 제목 (Claude가 붙임)"` : "";
@@ -1339,7 +1387,7 @@ function renderSessionRow(s: SessionInfo, showPathHint = false): string {
   }
 
   return `
-    <div class="tree-session ${isFav ? "is-favorite" : ""} ${openSessionIds.has(s.session_id) ? "is-open" : ""} ${activeSessionId === s.session_id ? "is-active" : ""}" data-session-id="${s.session_id}" data-project-folder="${escapeHtml(s.project_folder)}" data-project-path="${escapeHtml(s.project_path)}" data-account-name="${escapeHtml(s.account_name || "")}">
+    <div class="tree-session ${isFav ? "is-favorite" : ""} ${s.is_pending ? "is-pending" : ""} ${openSessionIds.has(s.session_id) ? "is-open" : ""} ${activeSessionId === s.session_id ? "is-active" : ""}" data-session-id="${s.session_id}" data-project-folder="${escapeHtml(s.project_folder)}" data-project-path="${escapeHtml(s.project_path)}" data-account-name="${escapeHtml(s.account_name || "")}">
       <div class="session-title"${titleTip}>${favIcon}<span class="session-open-icon" title="터미널에서 열려 있음">${ICONS.terminal}</span>${escapeHtml(title)}</div>
       <div class="session-meta">
         ${pathHint}
@@ -2218,6 +2266,15 @@ function renderShell() {
       const folder = sessionEl.dataset.projectFolder!;
       const path = sessionEl.dataset.projectPath!;
       const isFav = favoriteSessions.has(sid);
+      if (pendingSessions.some((x) => x.session_id === sid)) {
+        showContextMenu(e.clientX, e.clientY, [
+          { label: "탭으로 이동", icon: ICONS.terminal, action: () => void emit("focus-session", { session_id: sid }) },
+          { label: "제목 편집", icon: ICONS.edit, action: () => void editSessionTitle(sid) },
+          { label: "-", action: () => {} },
+          { label: "탭 닫기", icon: ICONS.close, action: () => void invoke("close_session_tabs", { sessionIds: [sid] }), danger: true },
+        ]);
+        return;
+      }
       const s = allSessions.find((x) => x.session_id === sid);
       const resolvedAcc = resolveSessionAccountName(s);
       const accLabel = (() => {
@@ -2383,6 +2440,12 @@ if (!IS_TERMINAL_WINDOW) {
       if (!event.payload.title) {
         lastAutoTitle.delete(event.payload.session_id);
         window.setTimeout(() => void syncAutoTitles(), 300);
+      }
+      const pending = pendingSessions.find((x) => x.session_id === event.payload.session_id);
+      if (pending) {
+        pending.custom_title = event.payload.title;
+        renderTree();
+        return;
       }
       const s = allSessions.find((x) => x.session_id === event.payload.session_id);
       if (!s) { void loadSessions(); return; }

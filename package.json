@@ -1,7 +1,7 @@
 {
   "name": "simple-claude-session-manager",
   "private": true,
-  "version": "1.2.6",
+  "version": "1.2.7",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
