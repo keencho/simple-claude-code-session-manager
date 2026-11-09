@@ -2956,3 +2956,17 @@ body.statusbar-hidden .terminal-status-bar { display: none; }
 .session-open-icon svg { width: 12px; height: 12px; }
 .tree-session.is-active,
 .tree-session.is-active:hover { background: var(--bg-4, var(--bg-hover)); }
+
+/* 설정 제목 옆 업데이트 확인 버튼 */
+.settings-update-btn { margin-left: 10px; vertical-align: middle; }
+
+/* 사이드바 통계 줄: 새 버전이 있을 때만 나오는 설치 링크 */
+.stats-update {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--accent);
+  cursor: pointer;
+}
+.stats-update:hover { text-decoration: underline; }

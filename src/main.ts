@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, emit } from "@tauri-apps/api/event";
 import { open, save, ask } from "@tauri-apps/plugin-dialog";
-import { check } from "@tauri-apps/plugin-updater";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -485,21 +485,59 @@ function renderUsageStatus(_report: UsageReport | null) {
 }
 
 // Installing restarts the app and kills every open claude PTY, so always ask first.
-async function checkForUpdate() {
+// Stop the tabs running these sessions before their files are deleted.
+async function closeTabsOfSessions(sessionIds: string[]) {
+  if (!sessionIds.some((id) => openSessionIds.has(id))) return;
   try {
-    const update = await check();
-    if (!update) return;
-    const ok = await ask(
-      `새 버전 ${update.version} 이 있습니다 (현재 ${update.currentVersion}).
+    await invoke("close_session_tabs", { sessionIds });
+    // Give the killed claude a moment to let go of its jsonl.
+    await new Promise((r) => setTimeout(r, 300));
+  } catch {}
+}
 
-지금 설치하면 앱이 재시작되고 열린 터미널이 모두 종료됩니다.`,
-      { title: "업데이트", okLabel: "설치", cancelLabel: "나중에" },
-    );
-    if (!ok) return;
+// Update found but not installed yet: shown as a link in the sidebar stats line.
+let pendingUpdate: Update | null = null;
+let installingUpdate = false;
+const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+// startup: ask right away (nobody is mid-work yet)
+// background: every 6h while running; never pops a dialog, only the stats link
+// manual: the settings button; also says so when already up to date
+async function checkForUpdate(mode: "startup" | "background" | "manual") {
+  let update: Update | null = null;
+  try {
+    update = await check();
+  } catch (e) {
+    console.warn("update check failed", e);
+    if (mode === "manual") await customAlert("업데이트 확인 실패: " + e);
+    return;
+  }
+  pendingUpdate = update;
+  renderStats();
+  if (!update) {
+    if (mode === "manual") await customAlert(`최신 버전입니다 (v${appVersion}).`);
+    return;
+  }
+  if (mode !== "background") await installPendingUpdate();
+}
+
+// The restart kills every open claude, so always ask. Session restore (if on)
+// reopens them after the restart.
+async function installPendingUpdate() {
+  const update = pendingUpdate;
+  if (!update || installingUpdate) return;
+  const ok = await ask(
+    `새 버전 ${update.version} 이 있습니다 (현재 ${update.currentVersion}).\n\n지금 설치하면 앱이 재시작됩니다. 열려 있던 세션은 재시작 후 다시 열립니다(설정 > 세션 복원이 켜져 있을 때).`,
+    { title: "업데이트", okLabel: "설치", cancelLabel: "나중에" },
+  );
+  if (!ok) return;
+  installingUpdate = true;
+  try {
     await update.downloadAndInstall();
     await relaunch();
   } catch (e) {
-    console.warn("update check failed", e);
+    installingUpdate = false;
+    await customAlert("업데이트 설치 실패: " + e);
   }
 }
 
@@ -1211,6 +1249,7 @@ async function deleteGroupSessions(label: string) {
   if (!ok) return;
   try {
     for (const f of folders) {
+      await closeTabsOfSessions(allSessions.filter((x) => x.project_folder === f).map((x) => x.session_id));
       await invoke("delete_project_sessions", { projectFolder: f, accountName: null });
       delete projectLabels[f];
     }
@@ -1228,9 +1267,11 @@ async function deleteSession(sessionId: string, projectFolder: string) {
   deleteInProgress = true;
   try {
     const s = allSessions.find((x) => x.session_id === sessionId);
-    const desc = s?.custom_title || s?.labels[0] || s?.first_prompt?.slice(0, 40) || sessionId;
-    const ok = await customConfirm(`"${desc}" 세션을 삭제할까요?`, "세션 삭제", true);
+    const desc = s?.custom_title || s?.ai_title || s?.labels[0] || s?.first_prompt?.slice(0, 40) || sessionId;
+    const openNote = openSessionIds.has(sessionId) ? "\n열려 있는 탭도 함께 닫힙니다." : "";
+    const ok = await customConfirm(`"${desc}" 세션을 삭제할까요?${openNote}`, "세션 삭제", true);
     if (!ok) return;
+    await closeTabsOfSessions([sessionId]);
     await invoke("delete_session", { sessionId, projectFolder, accountName: s?.account_name ?? null });
     allSessions = allSessions.filter((x) => x.session_id !== sessionId);
     renderChips();
@@ -1253,6 +1294,7 @@ async function deleteProjectSessions(folder: string, path: string) {
   );
   if (!ok) return;
   try {
+    await closeTabsOfSessions(allSessions.filter((x) => x.project_folder === folder).map((x) => x.session_id));
     await invoke("delete_project_sessions", { projectFolder: folder, accountName: null });
     allSessions = allSessions.filter((s) => s.project_folder !== folder);
     delete projectLabels[folder];
@@ -1314,7 +1356,12 @@ function renderStats() {
   const el = document.getElementById("stats");
   if (!el) return;
   const filtered = getFilteredSessions();
-  el.textContent = `전체 ${allSessions.length} · 표시 ${filtered.length}` + (appVersion ? ` · v${appVersion}` : "");
+  const base = `전체 ${allSessions.length} · 표시 ${filtered.length}` + (appVersion ? ` · v${appVersion}` : "");
+  if (pendingUpdate) {
+    el.innerHTML = `${escapeHtml(base)} · <button class="stats-update" title="눌러서 설치">v${escapeHtml(pendingUpdate.version)} 업데이트</button>`;
+  } else {
+    el.textContent = base;
+  }
 }
 
 function renderChips() {
@@ -1526,7 +1573,7 @@ async function openSettings() {
   overlay.innerHTML = `
     <div class="modal modal-settings">
       <header class="settings-header">
-        <div class="settings-title">설정${appVersion ? ` <span class="settings-version">v${appVersion}</span>` : ""}</div>
+        <div class="settings-title">설정${appVersion ? ` <span class="settings-version">v${appVersion}</span>` : ""}<button class="btn-secondary-sm settings-update-btn" id="settings-check-update">업데이트 확인</button></div>
         <button class="settings-close" title="닫기">${ICONS.close}</button>
       </header>
       <div class="settings-body">
@@ -1700,6 +1747,13 @@ async function openSettings() {
       const n = await invoke<number>("clear_logs");
       await customAlert(`${n}개 로그 파일을 삭제했습니다.`);
     } catch (err) { await customAlert("로그 삭제 실패: " + err); }
+  });
+  overlay.querySelector("#settings-check-update")!.addEventListener("click", async (e) => {
+    const btn = e.currentTarget as HTMLButtonElement;
+    btn.disabled = true;
+    btn.textContent = "확인 중…";
+    try { await checkForUpdate("manual"); }
+    finally { btn.disabled = false; btn.textContent = "업데이트 확인"; }
   });
   overlay.querySelector("#settings-restore-sessions")!.addEventListener("change", async (e) => {
     const checked = (e.target as HTMLInputElement).checked;
@@ -2285,7 +2339,11 @@ if (!IS_TERMINAL_WINDOW) {
     // Load terminal module AFTER the DOM is ready so it can mount into
     // #tabs / #terminals created by renderShell.
     await import("./terminal");
-    void checkForUpdate();
+    void checkForUpdate("startup");
+    window.setInterval(() => void checkForUpdate("background"), UPDATE_CHECK_INTERVAL_MS);
+    document.getElementById("stats")?.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).closest(".stats-update")) void installPendingUpdate();
+    });
     // Kick off usage: initial snapshot + live listener.
     void refreshUsage();
     listen<UsageReport>("usage-update", (event) => {

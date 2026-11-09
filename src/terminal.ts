@@ -1673,6 +1673,11 @@ listen<{ session_id: string; title: string }>("session-auto-title", (ev) => {
   updateWindowTitle();
 });
 
+// The session was deleted from the sidebar; the backend already stopped it.
+listen<string[]>("session-tabs-closed", (ev) => {
+  for (const id of ev.payload) if (findPane(id)) void closePane(id);
+});
+
 listen<{ session_id: string }>("focus-session", async (ev) => {
   for (const tab of tabs.values()) {
     const pane = tab.panes.find(p => p.sessionId === ev.payload.session_id && !p.exited);

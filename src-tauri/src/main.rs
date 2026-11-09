@@ -1629,6 +1629,35 @@ async fn kill_terminals(ids: Vec<String>, state: &AppState) {
     }
 }
 
+// Before deleting sessions: stop every tab running them, so claude can't
+// recreate the jsonl right after it is removed, and tell all windows to drop
+// those tabs.
+#[tauri::command]
+async fn close_session_tabs(
+    session_ids: Vec<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let terminal_ids: Vec<String> = {
+        let mut open = state.open_sessions.lock().unwrap();
+        let ids = open
+            .iter()
+            .filter(|e| session_ids.contains(&e.session_id))
+            .map(|e| e.terminal_id.clone())
+            .collect::<Vec<_>>();
+        open.retain(|e| !session_ids.contains(&e.session_id));
+        save_open_sessions(&open);
+        ids
+    };
+    if terminal_ids.is_empty() {
+        return Ok(());
+    }
+    kill_terminals(terminal_ids.clone(), &state).await;
+    let _ = app.emit("session-tabs-closed", terminal_ids);
+    let _ = app.emit("open-sessions-changed", ());
+    Ok(())
+}
+
 #[tauri::command]
 async fn pty_kill_many(
     terminal_ids: Vec<String>,
@@ -3256,6 +3285,7 @@ fn main() {
             get_open_sessions,
             session_id_for_terminal,
             get_ai_titles,
+            close_session_tabs,
             open_path_in_os,
             get_metadata_paths,
             export_metadata_to,
