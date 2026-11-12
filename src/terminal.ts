@@ -1723,6 +1723,55 @@ function promptText(message: string, defaultValue: string): Promise<string | nul
   });
 }
 
+// Cancel is focused, so a stray Enter never deletes.
+function confirmDanger(message: string, okLabel: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "dialog-overlay";
+    overlay.innerHTML = `
+      <div class="dialog-box">
+        <div class="dialog-message"></div>
+        <div class="dialog-footer">
+          <button class="dialog-btn dialog-btn-cancel">취소</button>
+          <button class="dialog-btn dialog-btn-ok dialog-btn-danger"></button>
+        </div>
+      </div>`;
+    (overlay.querySelector(".dialog-message") as HTMLElement).textContent = message;
+    (overlay.querySelector(".dialog-btn-ok") as HTMLElement).textContent = okLabel;
+    document.body.appendChild(overlay);
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") close(false); };
+    const close = (v: boolean) => { document.removeEventListener("keydown", onKey); overlay.remove(); resolve(v); };
+    overlay.querySelector(".dialog-btn-ok")!.addEventListener("click", () => close(true));
+    overlay.querySelector(".dialog-btn-cancel")!.addEventListener("click", () => close(false));
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(false); });
+    document.addEventListener("keydown", onKey);
+    setTimeout(() => (overlay.querySelector(".dialog-btn-cancel") as HTMLElement).focus(), 0);
+  });
+}
+
+async function deleteSessionFromPane(pane: Pane) {
+  const sid = pane.sessionId;
+  if (!sid) return;
+  const project = pane.baseTitle.split(":")[0];
+  const name = pane.baseTitle.startsWith(project + ":") ? pane.baseTitle.slice(project.length + 1) : pane.baseTitle;
+  const ok = await confirmDanger(`"${name}" 세션을 삭제할까요?\n열려 있는 탭도 함께 닫힙니다.`, "삭제");
+  if (!ok) { pane.term.focus(); return; }
+  try {
+    await invoke("delete_session_by_id", { sessionId: sid });
+  } catch (e) {
+    pane.term.writeln(`\x1b[1;31m세션 삭제 실패: ${e}\x1b[0m`);
+  }
+}
+
+// Sessions that haven't had a message yet have nothing to delete: offer only
+// closing the tab for those.
+async function sessionHasFile(sid: string): Promise<boolean> {
+  try {
+    const live = await invoke<{ session_id: string; has_jsonl: boolean }[]>("get_open_sessions");
+    return live.find((l) => l.session_id === sid)?.has_jsonl ?? true;
+  } catch { return true; }
+}
+
 async function renameSessionFromPane(pane: Pane) {
   const sid = pane.sessionId;
   if (!sid) return;
@@ -1794,7 +1843,7 @@ function showContextMenu(x: number, y: number, items: MenuItem[]) {
 }
 
 // Tab button right-click menu
-tabsEl.addEventListener("contextmenu", (e) => {
+tabsEl.addEventListener("contextmenu", async (e) => {
   const tabEl = (e.target as HTMLElement).closest(".tab") as HTMLElement | null;
   if (!tabEl) return;
   e.preventDefault();
@@ -1819,11 +1868,14 @@ tabsEl.addEventListener("contextmenu", (e) => {
   items.push({ label: tab.broadcast ? "브로드캐스트 OFF" : "브로드캐스트 ON", action: () => { setActiveTab(tabId); toggleBroadcastActive(); } });
   items.push({ label: "-", action: () => {} });
   items.push({ label: "탭 닫기", action: () => void closeTab(tabId), danger: true });
+  if (ap && ap.sessionId && await sessionHasFile(ap.sessionId)) {
+    items.push({ label: "세션 삭제…", action: () => void deleteSessionFromPane(ap), danger: true });
+  }
   showContextMenu(e.clientX, e.clientY, items);
 });
 
 // Pane header right-click menu
-termsEl.addEventListener("contextmenu", (e) => {
+termsEl.addEventListener("contextmenu", async (e) => {
   const header = (e.target as HTMLElement).closest(".pane-header") as HTMLElement | null;
   const xtermArea = (e.target as HTMLElement).closest(".pane-xterm") as HTMLElement | null;
   const paneEl = (header ?? xtermArea)?.closest(".term-pane") as HTMLElement | null;
@@ -1855,6 +1907,9 @@ termsEl.addEventListener("contextmenu", (e) => {
   items.push({ label: tab.zoomedPaneId === paneId ? "전체화면 해제" : "전체화면", action: () => toggleZoomForPane(tab, paneId) });
   items.push({ label: "-", action: () => {} });
   items.push({ label: "pane 닫기", action: () => void closePane(paneId), danger: true });
+  if (pane.sessionId && await sessionHasFile(pane.sessionId)) {
+    items.push({ label: "세션 삭제…", action: () => void deleteSessionFromPane(pane), danger: true });
+  }
   showContextMenu(e.clientX, e.clientY, items);
 });
 

@@ -2973,3 +2973,7 @@ body.statusbar-hidden .terminal-status-bar { display: none; }
 
 /* 첫 메시지 전이라 아직 파일이 없는 새 세션의 임시 행 */
 .tree-session.is-pending .session-title { color: var(--text-secondary); }
+
+/* 삭제처럼 되돌릴 수 없는 확인 버튼 */
+.dialog-btn-ok.dialog-btn-danger { background: var(--red); color: #fff; }
+.dialog-btn-ok.dialog-btn-danger:hover { background: color-mix(in srgb, var(--red) 85%, black); }

@@ -1651,6 +1651,11 @@ async fn close_session_tabs(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    stop_session_tabs(&session_ids, &app, &state).await;
+    Ok(())
+}
+
+async fn stop_session_tabs(session_ids: &[String], app: &AppHandle, state: &AppState) {
     let terminal_ids: Vec<String> = {
         let mut open = state.open_sessions.lock().unwrap();
         let ids = open
@@ -1663,11 +1668,37 @@ async fn close_session_tabs(
         ids
     };
     if terminal_ids.is_empty() {
-        return Ok(());
+        return;
     }
-    kill_terminals(terminal_ids.clone(), &state).await;
+    kill_terminals(terminal_ids.clone(), state).await;
     let _ = app.emit("session-tabs-closed", terminal_ids);
     let _ = app.emit("open-sessions-changed", ());
+}
+
+// Delete from a tab, which knows only the session id: find which account's
+// project folder holds the jsonl, stop the tabs first (or claude rewrites the
+// file), then delete. A session with no jsonl yet just loses its tabs.
+#[tauri::command]
+async fn delete_session_by_id(
+    session_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let file = format!("{}.jsonl", session_id);
+    let found = all_projects_dirs().into_iter().find_map(|(account, projects)| {
+        fs::read_dir(&projects).ok()?.flatten().find_map(|e| {
+            let dir = e.path();
+            dir.join(&file).is_file().then(|| {
+                (dir.file_name().unwrap_or_default().to_string_lossy().to_string(), account.clone())
+            })
+        })
+    });
+    stop_session_tabs(std::slice::from_ref(&session_id), &app, &state).await;
+    if let Some((folder, account)) = found {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        delete_session(session_id.clone(), folder, Some(account))?;
+    }
+    let _ = app.emit("session-deleted", session_id);
     Ok(())
 }
 
@@ -3299,6 +3330,7 @@ fn main() {
             session_id_for_terminal,
             get_ai_titles,
             close_session_tabs,
+            delete_session_by_id,
             open_path_in_os,
             get_metadata_paths,
             export_metadata_to,

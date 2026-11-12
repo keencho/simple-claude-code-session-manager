@@ -947,7 +947,8 @@ function customConfirm(message: string, title?: string, danger = false): Promise
       if (e.key === "Escape") { close(false); document.removeEventListener("keydown", esc); }
     };
     document.addEventListener("keydown", esc);
-    (overlay.querySelector(".dialog-btn-ok") as HTMLElement).focus();
+    // Dangerous confirms (delete) focus Cancel so a stray Enter does nothing.
+    (overlay.querySelector(danger ? ".dialog-btn-cancel" : ".dialog-btn-ok") as HTMLElement).focus();
   });
 }
 
@@ -2430,6 +2431,14 @@ if (!IS_TERMINAL_WINDOW) {
     // Cross-window toggle: a term-* window pressed Ctrl+Shift+B — flip + broadcast.
     listen("statusbar-toggle-request", () => setStatusBarVisible(!statusBarVisible));
     listen("open-sessions-changed", () => void refreshOpenSessions());
+    // Deleted from a tab (any window): drop the row here.
+    listen<string>("session-deleted", (event) => {
+      const sid = event.payload;
+      allSessions = allSessions.filter((x) => x.session_id !== sid);
+      pendingSessions = pendingSessions.filter((x) => x.session_id !== sid);
+      renderChips();
+      renderTree();
+    });
     listen<{ session_id: string | null }>("active-session-changed", (event) => {
       activeSessionId = event.payload.session_id;
       markActiveSessionRow();
